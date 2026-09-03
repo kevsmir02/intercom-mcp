@@ -26,7 +26,9 @@ holds context on this codebase, else antigravity or claude_code.
    test command followed by "run it and quote the result". It must be executable by someone
    with no access to this conversation.
 3. Call `delegate_to_<harness>` with an absolute `working_dir`, `include_diff: true`, and a
-   `timeout_seconds` sized to the task (default 900; larger for big work).
+   `timeout_seconds` sized to the task (default 900; larger for big work). Do not add a `--model`
+   flag on your own: leave `flags` empty so the harness uses its configured default model. Pass a
+   model only when the caller's brief explicitly names one.
 4. Branch on the report's prefix:
    - `[SUCCESS]`: review (step 5).
    - `[ROADBLOCK / FAILURE]`: read "Probable cause" and the diagnostics. An environment cause
