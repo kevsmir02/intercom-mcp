@@ -69,7 +69,7 @@ If `~/.local/bin` is not on your `PATH`, the installer says so; add
 
 | Command | Purpose |
 | --- | --- |
-| `intercom setup` | The wizard above. Re-run it any time to change harnesses, default flags or orchestrators. |
+| `intercom setup` | The wizard above. Safe to re-run: it preserves your current selection and lets you toggle harnesses, flags or orchestrators. |
 | `intercom setup --harness claude_code --orchestrator opencode --flags claude_code="--model sonnet" --yes` | Scripted setup for dotfiles and CI |
 | `intercom doctor` | Health of the enabled harnesses plus registration and skill checks; exits non-zero on any failure |
 | `intercom serve` | Runs the MCP server on stdio. This is what the registrations invoke |
@@ -81,6 +81,40 @@ If `~/.local/bin` is not on your `PATH`, the installer says so; add
 `serve` turns `config.json` into the environment variables the server reads, filling in only what the
 orchestrator's own environment block left unset. Setting `INTERCOM_HARNESSES=claude_code` there, for
 example, exposes only Claude Code's tools.
+
+## Updating
+
+Update an existing install in place:
+
+```bash
+intercom update
+```
+
+That pulls the latest code into `~/.local/share/intercom` and reinstalls the dependency. It does not
+change your registrations or which harnesses are exposed, since those are your settings. To pick up
+newly added harnesses (for example `opencode` and `pi`) and refresh the OpenCode timeout, run setup
+once more and restart the orchestrator:
+
+```bash
+intercom setup      # your current choices come pre-selected; tick any new harness you want
+```
+
+Re-running `curl ... | bash` or the agent-followed `INSTALL.md` updates in place the same way.
+
+## Registering with another Claude Code profile
+
+`intercom setup` registers the default Claude Code profile (`~/.claude`). To register a second profile
+that uses `CLAUDE_CONFIG_DIR`, point the same launcher at it and link the skill into that profile:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-b claude mcp add -s user intercom -- ~/.local/bin/intercom serve
+mkdir -p ~/.claude-b/skills
+ln -sn ~/.local/share/intercom/skills/intercom ~/.claude-b/skills/intercom
+```
+
+Both profiles share `~/.config/intercom/config.json`, so they expose the same harnesses. `intercom
+uninstall` only removes the default profile; remove a second profile with
+`CLAUDE_CONFIG_DIR=~/.claude-b claude mcp remove -s user intercom` and by deleting its skill link.
 
 ## Manual installation
 
