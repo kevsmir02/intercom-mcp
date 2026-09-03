@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-harness-bridge: a lightweight MCP server (stdio) that lets an orchestrator such as
+intercom: a lightweight MCP server (stdio) that lets an orchestrator such as
 OpenCode or Claude Code delegate implementation, refactoring and testing tasks to a
 headless coding harness and get a structured, reviewable report back.
 
@@ -24,6 +24,7 @@ Result prefixes (branch on these)
 Configuration (environment variables, all optional)
 ---------------------------------------------------
 Shared
+  INTERCOM_HARNESSES         comma-separated harness keys to expose            (default: all)
   BRIDGE_MAX_OUTPUT_CHARS    per-stream cap in tool results                    (default 60000)
   BRIDGE_KILL_GRACE_SECONDS  SIGTERM -> SIGKILL escalation delay               (default 5)
   BRIDGE_MAX_DEPTH           delegation depth allowed below this server        (default 1)
@@ -64,7 +65,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _ServerImpl
 
 __version__ = "2.0.0"
-SERVER_NAME = "harness-bridge"
+SERVER_NAME = "intercom"
 
 log = logging.getLogger(SERVER_NAME)
 
@@ -1305,8 +1306,22 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
     return delegate_tool, health_tool
 
 
-delegate_to_antigravity, check_antigravity_health = _register_harness(HARNESSES["antigravity"])
-delegate_to_claude_code, check_claude_code_health = _register_harness(HARNESSES["claude_code"])
+def enabled_harness_keys() -> list[str]:
+    """Harnesses whose tools are exposed: INTERCOM_HARNESSES=antigravity,claude_code (default all)."""
+    raw = _env("INTERCOM_HARNESSES")
+    if not raw:
+        return list(HARNESSES)
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    unknown = [k for k in keys if k not in HARNESSES]
+    if unknown:
+        log.warning("INTERCOM_HARNESSES names unknown harness(es) %s; known: %s", unknown, list(HARNESSES))
+    chosen = [k for k in keys if k in HARNESSES]
+    return chosen or list(HARNESSES)
+
+
+REGISTERED_TOOLS = {key: _register_harness(HARNESSES[key]) for key in enabled_harness_keys()}
+delegate_to_antigravity, check_antigravity_health = REGISTERED_TOOLS.get("antigravity", (None, None))
+delegate_to_claude_code, check_claude_code_health = REGISTERED_TOOLS.get("claude_code", (None, None))
 
 
 # ---------------------------------------------------------------------------
@@ -1322,7 +1337,7 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
         force=True,  # mcp 1.x FastMCP installs its own handler at construction time
     )
-    found = {h.key: h.resolve_binary() or "NOT FOUND" for h in HARNESSES.values()}
+    found = {key: HARNESSES[key].resolve_binary() or "NOT FOUND" for key in REGISTERED_TOOLS}
     log.info("%s %s starting on stdio (depth %s): %s", SERVER_NAME, __version__, bridge_depth(), found)
     mcp.run(transport="stdio")
 

@@ -1,6 +1,6 @@
-# harness-bridge
+# intercom
 
-A lightweight MCP server (stdio) that lets an orchestrator such as OpenCode or Claude Code delegate
+A lightweight MCP server that lets an orchestrator such as OpenCode or Claude Code delegate
 implementation, refactoring and testing tasks to a headless coding harness and get a structured,
 reviewable report back. Two harnesses are wired in:
 
@@ -11,123 +11,81 @@ reviewable report back. Two harnesses are wired in:
 
 Each harness runs in its JSON print mode, so every report carries the harness's conversation ID.
 Passing it back as `conversation_id` resumes that session with its full context: a review-fix round
-costs one short prompt.
+costs one short prompt. A bundled skill teaches the orchestrator the delegate -> review -> fix loop.
 
-## Files
+## Install
 
-| File | Purpose |
+One command installs the project, then a short wizard asks which harnesses to expose and which
+orchestrators to register:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kevsmir02/intercom-mcp/main/install.sh | bash
+```
+
+What it does:
+
+1. Checks for `git` and Python 3.10+.
+2. Clones the repository into `~/.local/share/intercom` (or updates it when already present).
+3. Creates a virtual environment there and installs the `mcp` dependency.
+4. Writes the `intercom` launcher to `~/.local/bin`.
+5. Runs `intercom setup`, which detects `agy` and `claude`, probes their health, asks which of them
+   to expose and which orchestrators to register with, writes the OpenCode config entry, runs
+   `claude mcp add` for Claude Code, links the skill where both orchestrators find it, and saves
+   its choices to `~/.config/intercom/config.json`.
+
+Restart the orchestrator afterwards and ask it to run `check_claude_code_health` or
+`check_antigravity_health`; a report starting with `[HEALTH: READY]` confirms the installation.
+
+Prerequisites for a useful install: at least one harness logged in. `agy models` lists models only
+when the Antigravity login is valid, and `claude auth status` must report `"loggedIn": true`.
+
+### Installer options
+
+| Form | Effect |
 | --- | --- |
-| `server.py` | The MCP server (harness adapters, subprocess runner, report formatting) |
-| `requirements.txt` | Runtime dependency (`mcp`, works with 1.x and 2.x) |
-| `opencode.json` | Registration snippet for OpenCode's `mcp` settings |
-| `test_bridge.py` | Hermetic tests using fake `agy` and `claude` binaries (no quota consumed) |
-| `skills/harness-bridge/SKILL.md` | Skill teaching the orchestrator the delegate -> review -> fix loop |
+| `curl ... \| bash -s -- --no-setup` | Install only; run `intercom setup` later |
+| `curl ... \| bash -s -- --yes` | Setup with detected defaults, no questions |
+| `INTERCOM_HOME=/opt/intercom curl ... \| bash` | Install elsewhere |
+| `INTERCOM_BIN_DIR=/usr/local/bin curl ... \| bash` | Put the launcher elsewhere |
+| `INTERCOM_REF=v1.0.0 curl ... \| bash` | Install a branch or tag |
 
-## Installation
+If `~/.local/bin` is not on your `PATH`, the installer says so; add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
 
-The steps below assume a POSIX shell. Every path in the registrations must be absolute, so the
-walkthrough sets `BRIDGE_DIR` once and reuses it.
+## The `intercom` command
 
-### 1. Prerequisites
+| Command | Purpose |
+| --- | --- |
+| `intercom setup` | The wizard above. Re-run it any time to change harnesses, default flags or orchestrators. |
+| `intercom setup --harness claude_code --orchestrator opencode --flags claude_code="--model sonnet" --yes` | Scripted setup for dotfiles and CI |
+| `intercom doctor` | Health of the enabled harnesses plus registration and skill checks; exits non-zero on any failure |
+| `intercom serve` | Runs the MCP server on stdio. This is what the registrations invoke |
+| `intercom test` | Runs the hermetic test suite (fake harnesses, no quota consumed) |
+| `intercom update` | `git pull` plus dependency reinstall |
+| `intercom config` | Prints the configuration and every path in use |
+| `intercom uninstall [--purge]` | Removes registrations, skill links, launcher and config; `--purge` also deletes the checkout |
 
-- Python 3.10 or newer (`python3 --version`).
-- `git` on `PATH`, used for the change summary in every report.
-- At least one harness installed and logged in:
-  - Antigravity: `agy` on `PATH`. Run `agy` once interactively to log in, then confirm with
-    `agy models`, which lists models only when the login is valid.
-  - Claude Code: `claude` on `PATH`. Log in with `claude auth login`, then confirm with
-    `claude auth status`, which must report `"loggedIn": true`.
+`serve` turns `config.json` into the environment variables the server reads, filling in only what the
+orchestrator's own environment block left unset. Setting `INTERCOM_HARNESSES=claude_code` there, for
+example, exposes only Claude Code's tools.
 
-### 2. Place the project
+## Manual installation
 
-Copy or clone this directory to a permanent location and point `BRIDGE_DIR` at it:
-
-```bash
-export BRIDGE_DIR="$HOME/Projects/PERSONAL/intercom"   # adjust to where you put it
-cd "$BRIDGE_DIR"
-```
-
-### 3. Create the virtual environment and install the dependency
+For a checkout you manage yourself:
 
 ```bash
+git clone https://github.com/kevsmir02/intercom-mcp.git
+cd intercom-mcp
 python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
-```
-
-`python3 -m venv` bootstraps `pip` inside the venv, so a system-wide `pip` is not required.
-
-### 4. Run the test suite
-
-```bash
 .venv/bin/python test_bridge.py
+.venv/bin/python intercom.py setup
 ```
 
-The suite starts the real server over stdio against fake `agy` and `claude` scripts, so it consumes no
-quota. It ends with `OK` when the installation is sound. `python -m pytest -q test_bridge.py` works too
-if pytest is installed.
-
-### 5. Register the server with OpenCode
-
-Merge the `mcp` block of `opencode.json` into your OpenCode config, either the global
-`~/.config/opencode/opencode.json` or a project-level `opencode.json`. Replace the two entries of
-`command` with `$BRIDGE_DIR/.venv/bin/python` and `$BRIDGE_DIR/server.py` spelled out as absolute paths.
-
-OpenCode merges the `environment` block over its own process environment, so `PATH`, `HOME` and the
-harness logins are inherited. The `timeout` of 1200000 ms keeps long delegations alive. Restart
-OpenCode; the tools appear prefixed with the server key, `harness-bridge`.
-
-### 6. Register the server with Claude Code
-
-```bash
-claude mcp add -s user harness-bridge \
-  -e BRIDGE_MAX_DEPTH=1 \
-  -- "$BRIDGE_DIR/.venv/bin/python" "$BRIDGE_DIR/server.py"
-claude mcp list        # harness-bridge should show as Connected
-```
-
-Add more `-e KEY=value` pairs for any variable from the table below, for example
-`-e CLAUDE_DEFAULT_FLAGS="--model sonnet"` to pin a cheaper model for delegations.
-Use `-s project` instead of `-s user` to register for one repository only.
-
-### 7. Install the skill
-
-Both Claude Code and OpenCode load skills from `~/.claude/skills/`, so one symlink serves both:
-
-```bash
-mkdir -p ~/.claude/skills
-ln -sn "$BRIDGE_DIR/skills/harness-bridge" ~/.claude/skills/harness-bridge
-```
-
-OpenCode also reads `~/.config/opencode/skills/` and project-level `.opencode/skills/` if you prefer
-one of those. The skill is model-invoked: the orchestrator reaches for it on its own when a task is
-worth delegating or a delegation report needs review, and you can invoke it by name as
-`/harness-bridge`.
-
-### 8. Verify from the orchestrator
-
-Start OpenCode or Claude Code and ask it to run `check_claude_code_health` or
-`check_antigravity_health`. A report starting with `[HEALTH: READY]` means the binary was found, its
-version answered and the authentication probe passed. `[HEALTH: DEGRADED]` names the failing probe;
-`[HEALTH: UNAVAILABLE]` means the binary is missing from `PATH`, which `AGY_BIN` or `CLAUDE_BIN` can fix.
-
-Then try a small delegation in a scratch repository, for example "create hello.txt containing the
-word hello, run `cat hello.txt` and quote the output", and confirm the report starts with
-`[SUCCESS]` and lists the file under `git status --short`.
-
-### Updating
-
-Pull or copy the new files into `$BRIDGE_DIR`, rerun step 4, and restart the orchestrator. The
-registrations and the skill symlink keep pointing at the same paths.
-
-### Uninstalling
-
-```bash
-claude mcp remove -s user harness-bridge
-rm ~/.claude/skills/harness-bridge
-```
-
-Remove the `harness-bridge` entry from your OpenCode config, then delete `$BRIDGE_DIR`.
+`intercom.py setup` writes the launcher and performs the same registrations as the installer. To
+register by hand instead, use `opencode.json` in this repository as the OpenCode template and
+`claude mcp add -s user intercom -- <launcher> serve` for Claude Code, then symlink `skills/intercom`
+into `~/.claude/skills/intercom`.
 
 ## Tool results
 
@@ -143,6 +101,18 @@ Every `delegate_to_<harness>` result starts with one of:
 Each report also carries `Conversation ID` and `Harness stats` (status, turns, tokens, cost, model).
 `check_<harness>_health` returns `[HEALTH: READY]`, `[HEALTH: DEGRADED]` or `[HEALTH: UNAVAILABLE]`.
 
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `install.sh` | The `curl | bash` installer |
+| `intercom.py` | The `intercom` command (setup wizard, doctor, serve, update, uninstall) |
+| `server.py` | The MCP server (harness adapters, subprocess runner, report formatting) |
+| `skills/intercom/SKILL.md` | Skill teaching the orchestrator the delegate -> review -> fix loop |
+| `test_bridge.py`, `test_cli.py` | Hermetic tests with fake `agy` and `claude` binaries |
+| `opencode.json` | Template for a manual OpenCode registration |
+| `requirements.txt` | Runtime dependency (`mcp`, works with 1.x and 2.x) |
+
 ## Harness facts the bridge relies on
 
 - `agy` (1.1.24 and 1.1.25): headless mode is `-p <prompt>` or the prompt on stdin; auto-approve is
@@ -156,11 +126,14 @@ Each report also carries `Conversation ID` and `Harness stats` (status, turns, t
 
 ## Environment variables
 
+Set these in the orchestrator's environment block, or let `intercom setup` manage the ones it covers.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `INTERCOM_HARNESSES` | all | Comma-separated harness keys whose tools are exposed |
 | `AGY_BIN` / `CLAUDE_BIN` | `agy` / `claude` | Binary name or absolute path |
 | `AGY_AUTO_APPROVE_FLAGS` / `CLAUDE_AUTO_APPROVE_FLAGS` | `--dangerously-skip-permissions` | Injected when `auto_approve` is true |
-| `AGY_DEFAULT_FLAGS` / `CLAUDE_DEFAULT_FLAGS` | (empty) | Flags appended to every delegation, e.g. `--model <id>` |
+| `AGY_DEFAULT_FLAGS` / `CLAUDE_DEFAULT_FLAGS` | (empty) | Flags appended to every delegation, e.g. `--model sonnet` |
 | `BRIDGE_MAX_DEPTH` | `1` | Delegation depth allowed below this server (loop guard) |
 | `BRIDGE_MAX_OUTPUT_CHARS` | `60000` | Per-stream cap in tool results |
 | `BRIDGE_KILL_GRACE_SECONDS` | `5` | Delay between SIGTERM and SIGKILL |

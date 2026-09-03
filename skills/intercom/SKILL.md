@@ -1,9 +1,9 @@
 ---
-name: harness-bridge
-description: Delegate implementation, refactoring or test-writing work to a headless coding harness (Antigravity `agy` or Claude Code) through the harness-bridge MCP tools, then run the review-fix loop on the report. Use when a task is scoped enough to hand off, when this session should spare its own context or quota, or when a delegation report has come back and needs review.
+name: intercom
+description: Delegate implementation, refactoring or test-writing work to a headless coding harness (Antigravity `agy` or Claude Code) through the intercom MCP tools, then run the review-fix loop on the report. Use when a task is scoped enough to hand off, when this session should spare its own context or quota, or when a delegation report has come back and needs review.
 ---
 
-# Harness bridge: delegate, review, fix
+# Intercom: delegate, review, fix
 
 You are the orchestrator. The harness is a subagent with its own quota, tools and memory:
 it edits files and runs tests; you own the brief, the review and the acceptance. The

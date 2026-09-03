@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated tests for harness-bridge (server.py).
+"""Automated tests for the intercom MCP server (server.py).
 
 The MCP server is started for real over stdio (the same way OpenCode / Claude Code start
 it) but pointed at *fake* `agy` and `claude` binaries, so the suite is hermetic and
@@ -61,6 +61,23 @@ if not is_claude and args[:1] == ["models"]:
         sys.stderr.write("Error: not authenticated. Run 'agy' interactively to log in.\n")
         sys.exit(1)
     out("Fetching available models...\nfake-model-high\tFake Model (High)\nfake-model-low\tFake Model (Low)\n")
+    sys.exit(0)
+if is_claude and args[:1] == ["mcp"]:
+    # `claude mcp add|remove|get` used by intercom.py; a marker file stands in for the registration.
+    log, marker = os.environ.get("FAKE_MCP_LOG"), os.environ.get("FAKE_MCP_MARKER")
+    if log:
+        with open(log, "a") as fh:
+            fh.write(" ".join(args) + "\n")
+    sub = args[1] if len(args) > 1 else ""
+    if sub == "add" and marker:
+        open(marker, "w").write("registered\n")
+    elif sub == "remove":
+        if marker and os.path.exists(marker):
+            os.remove(marker)
+        else:
+            sys.exit(1)
+    elif sub == "get":
+        sys.exit(0 if marker and os.path.exists(marker) else 1)
     sys.exit(0)
 if is_claude and args[:2] == ["auth", "status"]:
     out(json.dumps({
@@ -191,7 +208,7 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
     """Shared fixture: temp dir with fake binaries, a work dir, and an env for the server."""
 
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="harness-bridge-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="intercom-test-"))
         self.fake_dir = self.tmp / "bin"
         self.fake_dir.mkdir()
         self.fake_agy = self._install_fake("agy")
