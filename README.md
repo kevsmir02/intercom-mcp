@@ -87,6 +87,21 @@ register by hand instead, use `opencode.json` in this repository as the OpenCode
 `claude mcp add -s user intercom -- <launcher> serve` for Claude Code, then symlink `skills/intercom`
 into `~/.claude/skills/intercom`.
 
+## Long-running delegations
+
+A delegation's own limit is `timeout_seconds` (default 900, up to 86400). The orchestrator also
+applies its own timeout to every MCP tool call, which can be shorter. To stop a long delegation from
+being cut off by the orchestrator, the server emits a progress notification every
+`BRIDGE_HEARTBEAT_SECONDS` (default 15). OpenCode resets its tool-call timer on each one, so the call
+survives for the whole delegation, and `timeout_seconds` stays the real bound.
+
+- **OpenCode**: the generated config sets `mcp.intercom.timeout` to one hour as a backstop; the
+  heartbeat handles anything longer.
+- **Claude Code**: it honours the heartbeat as well; if a delegation still gets cut off, raise
+  `MCP_TOOL_TIMEOUT` (milliseconds) in its environment.
+
+Set `BRIDGE_HEARTBEAT_SECONDS=0` to disable the heartbeat.
+
 ## Tool results
 
 Every `delegate_to_<harness>` result starts with one of:
@@ -137,5 +152,6 @@ Set these in the orchestrator's environment block, or let `intercom setup` manag
 | `BRIDGE_MAX_DEPTH` | `1` | Delegation depth allowed below this server (loop guard) |
 | `BRIDGE_MAX_OUTPUT_CHARS` | `60000` | Per-stream cap in tool results |
 | `BRIDGE_KILL_GRACE_SECONDS` | `5` | Delay between SIGTERM and SIGKILL |
+| `BRIDGE_HEARTBEAT_SECONDS` | `15` | Progress-notification interval that keeps long delegations under the client's tool-call timeout (`0` disables) |
 | `BRIDGE_STRIP_ENV` | (empty) | Extra comma-separated variables hidden from every harness |
 | `BRIDGE_LOG_LEVEL` | `INFO` | Server log level (stderr) |

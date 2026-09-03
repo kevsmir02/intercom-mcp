@@ -20,7 +20,7 @@
         "BRIDGE_KILL_GRACE_SECONDS": "5",
         "BRIDGE_LOG_LEVEL": "INFO"
       },
-      "timeout": 1200000
+      "timeout": 3600000
     }
   }
 }

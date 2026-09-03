@@ -146,6 +146,9 @@ if "__HANG__" in prompt:
 if "__PLAIN__" in prompt:
     out("plain text output, no json\n" + text + "\n")
     sys.exit(0)
+if "__SLOW__" in prompt:
+    import time as _t
+    _t.sleep(float(os.environ.get("FAKE_SLEEP", "0.6")))
 if "__WRITE__:" in prompt:
     target = prompt.split("__WRITE__:", 1)[1].split()[0]
     with open(target, "w") as fh:
@@ -789,6 +792,67 @@ class TestProcessRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((bad.returncode, bad.stderr.strip()), (7, "oops"))
         fed = await bridge.run_process(["cat"], cwd="/", timeout=10, stdin_data=b"from-stdin", kill_grace=1)
         self.assertEqual(fed.stdout, "from-stdin")
+
+
+@unittest.skipUnless(os.name == "posix", "uses bash")
+class TestHeartbeat(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_fires_during_a_slow_run_and_stops_after(self) -> None:
+        ticks: list[tuple[float, float | None, str]] = []
+
+        async def progress(value: float, total: float | None, message: str) -> None:
+            ticks.append((value, total, message))
+
+        env = dict(os.environ, BRIDGE_HEARTBEAT_SECONDS="0")  # not read here; interval is a direct arg below
+        # Drive run_process_with_heartbeat with a fast interval via monkeypatched heartbeat_seconds.
+        original = bridge.heartbeat_seconds
+        bridge.heartbeat_seconds = lambda: 0.1
+        try:
+            result = await bridge.run_process_with_heartbeat(
+                ["bash", "-c", "echo hi; sleep 0.6; echo done"],
+                cwd="/", timeout=30, progress=progress, label="unit delegation", env=env,
+            )
+        finally:
+            bridge.heartbeat_seconds = original
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("done", result.stdout)
+        self.assertGreaterEqual(len(ticks), 2, "expected an initial tick plus at least one heartbeat")
+        self.assertEqual(ticks[0][0], 0.0)
+        self.assertTrue(ticks[0][2].startswith("unit delegation: started"))
+        values = [v for v, _, _ in ticks]
+        self.assertEqual(values, sorted(values), "progress values must be non-decreasing")
+        self.assertEqual(len(set(values)), len(values), "progress values must strictly increase")
+
+    async def test_disabled_when_interval_zero(self) -> None:
+        calls = 0
+
+        async def progress(value: float, total: float | None, message: str) -> None:
+            nonlocal calls
+            calls += 1
+
+        original = bridge.heartbeat_seconds
+        bridge.heartbeat_seconds = lambda: 0.0
+        try:
+            result = await bridge.run_process_with_heartbeat(
+                ["bash", "-c", "echo hi"], cwd="/", timeout=10, progress=progress, label="x"
+            )
+        finally:
+            bridge.heartbeat_seconds = original
+        self.assertEqual(result.stdout.strip(), "hi")
+        self.assertEqual(calls, 0, "no progress when the heartbeat interval is 0")
+
+    async def test_client_refusing_progress_does_not_break_the_run(self) -> None:
+        async def progress(value: float, total: float | None, message: str) -> None:
+            raise RuntimeError("client did not request progress")
+
+        original = bridge.heartbeat_seconds
+        bridge.heartbeat_seconds = lambda: 0.1
+        try:
+            result = await bridge.run_process_with_heartbeat(
+                ["bash", "-c", "sleep 0.4; echo ok"], cwd="/", timeout=10, progress=progress, label="x"
+            )
+        finally:
+            bridge.heartbeat_seconds = original
+        self.assertEqual(result.stdout.strip(), "ok")  # the failing progress sink is swallowed
 
 
 if __name__ == "__main__":

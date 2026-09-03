@@ -27,6 +27,7 @@ Shared
   INTERCOM_HARNESSES         comma-separated harness keys to expose            (default: all)
   BRIDGE_MAX_OUTPUT_CHARS    per-stream cap in tool results                    (default 60000)
   BRIDGE_KILL_GRACE_SECONDS  SIGTERM -> SIGKILL escalation delay               (default 5)
+  BRIDGE_HEARTBEAT_SECONDS   progress-notification interval during a run       (default 15; 0 disables)
   BRIDGE_MAX_DEPTH           delegation depth allowed below this server        (default 1)
   BRIDGE_STRIP_ENV           extra comma-separated env names hidden from every harness
   BRIDGE_LOG_LEVEL           DEBUG | INFO | WARNING | ERROR                    (default INFO)
@@ -43,6 +44,7 @@ Transport is stdio: stdout belongs to the MCP protocol, all logging goes to stde
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -61,8 +63,10 @@ from pydantic import Field
 
 try:  # mcp >= 2.0 (FastMCP was renamed to MCPServer)
     from mcp.server.mcpserver import MCPServer as _ServerImpl
+    from mcp.server.mcpserver import Context as _Context
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _ServerImpl
+    from mcp.server.fastmcp import Context as _Context
 
 __version__ = "2.0.0"
 SERVER_NAME = "intercom"
@@ -82,6 +86,9 @@ PROMPT_ARG_MAX_BYTES = 65_536  # above this the prompt is piped through stdin
 MAX_UNTRACKED_DIFF_FILES = 20
 DEPTH_ENV = "BRIDGE_DEPTH"
 CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+# An async progress sink: (progress_value, total_or_None, message) -> None.
+ProgressFn = Callable[[float, "float | None", str], "Any"]
 
 
 def _env(name: str, *aliases: str, default: str = "") -> str:
@@ -120,6 +127,12 @@ def max_output_chars() -> int:
 
 def kill_grace_seconds() -> float:
     return float(_env_int("BRIDGE_KILL_GRACE_SECONDS", 5, 0, "AGY_KILL_GRACE_SECONDS"))
+
+
+def heartbeat_seconds() -> float:
+    """Interval between progress notifications during a delegation. Clients that reset their
+    per-call timeout on progress (e.g. OpenCode) will not abort a long-running delegation."""
+    return float(_env_int("BRIDGE_HEARTBEAT_SECONDS", 15, 0))
 
 
 def bridge_depth() -> int:
@@ -493,6 +506,61 @@ async def run_process(
         duration=time.monotonic() - started,
         timed_out=timed_out,
     )
+
+
+async def run_process_with_heartbeat(
+    argv: list[str],
+    *,
+    cwd: str,
+    timeout: float,
+    stdin_data: bytes | None = None,
+    env: dict[str, str] | None = None,
+    progress: "ProgressFn | None" = None,
+    label: str = "task",
+) -> ProcessResult:
+    """run_process, plus a periodic progress notification while it runs.
+
+    A client that resets its per-request timeout on progress (OpenCode does; Claude Code
+    honours MCP_TOOL_TIMEOUT) then keeps the call alive for the whole delegation instead of
+    cutting it off at its own shorter tool-call timeout. The heartbeat is best-effort: if the
+    client did not ask for progress, the first send no-ops and the loop stops; it never fails
+    the run, and `timeout_seconds` stays the authoritative bound.
+    """
+    interval = heartbeat_seconds()
+    if progress is None or interval <= 0:
+        return await run_process(argv, cwd=cwd, timeout=timeout, stdin_data=stdin_data, env=env)
+
+    done = asyncio.Event()
+
+    async def beat() -> None:
+        start = time.monotonic()
+        ticks = 0
+        try:
+            await progress(0.0, None, f"{label}: started (budget {int(timeout)}s)")
+        except Exception:  # client does not want progress; stop trying
+            return
+        while not done.is_set():
+            try:
+                await asyncio.wait_for(done.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            if done.is_set():
+                return
+            ticks += 1
+            elapsed = time.monotonic() - start
+            try:
+                await progress(float(ticks), None, f"{label}: running {int(elapsed)}s of {int(timeout)}s budget")
+            except Exception:
+                return
+
+    task = asyncio.ensure_future(beat())
+    try:
+        return await run_process(argv, cwd=cwd, timeout=timeout, stdin_data=stdin_data, env=env)
+    finally:
+        done.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1090,7 @@ async def delegate(
     timeout_seconds: int,
     conversation_id: str | None,
     include_diff: bool,
+    progress: ProgressFn | None = None,
 ) -> str:
     cwd, error = validate_working_dir(working_dir)
     if error:
@@ -1082,8 +1151,14 @@ async def delegate(
     command = _display_command(argv, prompt, stdin_data is not None)
     log.info("delegating to %s in %s (timeout %ss): %s", harness.key, cwd, timeout_seconds, command)
     try:
-        result = await run_process(
-            argv, cwd=str(cwd), timeout=timeout_seconds, stdin_data=stdin_data, env=harness.child_env()
+        result = await run_process_with_heartbeat(
+            argv,
+            cwd=str(cwd),
+            timeout=timeout_seconds,
+            stdin_data=stdin_data,
+            env=harness.child_env(),
+            progress=progress,
+            label=f"{harness.key} delegation",
         )
     except OSError as exc:
         return _render(
@@ -1116,6 +1191,8 @@ async def health(harness: Harness) -> str:
         f"Default timeout: {DEFAULT_TIMEOUT_SECONDS}s"
         + (f" ({harness.timeout_flag} is set to timeout + {PRINT_TIMEOUT_MARGIN}s)" if harness.timeout_flag else ""),
         f"Delegation depth: {bridge_depth()} of max {max_depth()}",
+        f"Progress heartbeat: every {heartbeat_seconds():.0f}s"
+        + (" (disabled)" if heartbeat_seconds() <= 0 else " (keeps long delegations under the client's tool-call timeout)"),
         f"Env hidden from the harness: {', '.join((*harness.strip_env, *extra_strip_env())) or '(none)'}",
         f"HOME: {os.environ.get('HOME', '(unset)')}",
     ]
@@ -1276,8 +1353,16 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
         timeout_seconds: TimeoutArg = DEFAULT_TIMEOUT_SECONDS,
         conversation_id: ConversationArg = None,
         include_diff: IncludeDiffArg = False,
+        ctx: _Context = None,  # injected by the SDK; excluded from the tool's input schema
     ) -> str:
-        return await delegate(harness, prompt, working_dir, flags, auto_approve, timeout_seconds, conversation_id, include_diff)
+        progress: ProgressFn | None = None
+        if ctx is not None:
+            async def progress(value: float, total: float | None, message: str) -> None:
+                await ctx.report_progress(value, total, message)
+
+        return await delegate(
+            harness, prompt, working_dir, flags, auto_approve, timeout_seconds, conversation_id, include_diff, progress
+        )
 
     async def health_tool() -> str:
         return await health(harness)

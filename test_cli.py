@@ -69,6 +69,11 @@ class CliFixture(unittest.TestCase):
                 "BRIDGE_KILL_GRACE_SECONDS": "1",
             }
         )
+        # Detection uses shutil.which("opencode"); drop any PATH dir that ships it so the
+        # host's real OpenCode install cannot leak into tests that assert it is absent.
+        env["PATH"] = os.pathsep.join(
+            d for d in env.get("PATH", "").split(os.pathsep) if d and not (Path(d) / "opencode").exists()
+        )
         env.update(overrides)
         return env
 
@@ -183,9 +188,11 @@ class TestDoctorAndUninstall(CliFixture):
         before = self.run_cli("doctor")
         self.assertNotEqual(before.returncode, 0)
         self.assertIn("no harness enabled", before.stdout)
-        setup = self.run_cli("setup", "--yes", "--orchestrator", "claude_code", env=self.env(PATH=f"{self.bin_dir}:{os.environ['PATH']}"))
+        on_path = self.env()
+        on_path["PATH"] = f"{self.bin_dir}{os.pathsep}{on_path['PATH']}"
+        setup = self.run_cli("setup", "--yes", "--orchestrator", "claude_code", env=on_path)
         self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
-        after = self.run_cli("doctor", env=self.env(PATH=f"{self.bin_dir}:{os.environ['PATH']}"))
+        after = self.run_cli("doctor", env=on_path)
         self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
         self.assertIn("all checks passed", after.stdout)
         self.assertIn("[ok] Claude Code: `intercom` registered", after.stdout)

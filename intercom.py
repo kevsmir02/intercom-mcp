@@ -36,7 +36,7 @@ HARNESS_LABELS = {"antigravity": "Antigravity CLI (agy)", "claude_code": "Claude
 HARNESS_ENV_PREFIX = {"antigravity": "AGY", "claude_code": "CLAUDE"}
 ORCHESTRATOR_KEYS = ("opencode", "claude_code")
 ORCHESTRATOR_LABELS = {"opencode": "OpenCode", "claude_code": "Claude Code"}
-OPENCODE_TIMEOUT_MS = 1_200_000
+OPENCODE_TIMEOUT_MS = 3_600_000
 CONFIG_VERSION = 1
 
 
