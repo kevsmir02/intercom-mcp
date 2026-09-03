@@ -1,0 +1,7 @@
+# antigravity-bridge runtime dependency. Works with both SDK majors:
+#   mcp 1.x exposes FastMCP, mcp 2.x renamed it to MCPServer; server.py handles both.
+# pydantic is pulled in transitively by mcp.
+mcp>=1.2,<3
+
+# Optional, only for running test_bridge.py through pytest instead of `python test_bridge.py`:
+# pytest>=8

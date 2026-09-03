@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "harness-bridge": {
+      "type": "local",
+      "command": [
+        "/home/loba/Projects/PERSONAL/intercom/.venv/bin/python",
+        "/home/loba/Projects/PERSONAL/intercom/server.py"
+      ],
+      "enabled": true,
+      "environment": {
+        "AGY_BIN": "agy",
+        "AGY_AUTO_APPROVE_FLAGS": "--dangerously-skip-permissions",
+        "AGY_DEFAULT_FLAGS": "",
+        "CLAUDE_BIN": "claude",
+        "CLAUDE_AUTO_APPROVE_FLAGS": "--dangerously-skip-permissions",
+        "CLAUDE_DEFAULT_FLAGS": "",
+        "BRIDGE_MAX_DEPTH": "1",
+        "BRIDGE_MAX_OUTPUT_CHARS": "60000",
+        "BRIDGE_KILL_GRACE_SECONDS": "5",
+        "BRIDGE_LOG_LEVEL": "INFO"
+      },
+      "timeout": 1200000
+    }
+  }
+}
