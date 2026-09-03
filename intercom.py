@@ -40,9 +40,14 @@ HERE = Path(__file__).resolve().parent
 SERVER_KEY = "intercom"
 SKILL_NAME = "intercom"
 SKILL_SRC = HERE / "skills" / SKILL_NAME
-HARNESS_KEYS = ("antigravity", "claude_code")
-HARNESS_LABELS = {"antigravity": "Antigravity CLI (agy)", "claude_code": "Claude Code (claude)"}
-HARNESS_ENV_PREFIX = {"antigravity": "AGY", "claude_code": "CLAUDE"}
+HARNESS_KEYS = ("antigravity", "claude_code", "opencode", "pi")
+HARNESS_LABELS = {
+    "antigravity": "Antigravity CLI (agy)",
+    "claude_code": "Claude Code (claude)",
+    "opencode": "OpenCode (opencode)",
+    "pi": "pi (pi-coding-agent)",
+}
+HARNESS_ENV_PREFIX = {"antigravity": "AGY", "claude_code": "CLAUDE", "opencode": "OPENCODE", "pi": "PI"}
 ORCHESTRATOR_KEYS = ("opencode", "claude_code")
 ORCHESTRATOR_LABELS = {"opencode": "OpenCode", "claude_code": "Claude Code"}
 OPENCODE_TIMEOUT_MS = 3_600_000

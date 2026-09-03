@@ -32,7 +32,7 @@ Shared
   BRIDGE_STRIP_ENV           extra comma-separated env names hidden from every harness
   BRIDGE_LOG_LEVEL           DEBUG | INFO | WARNING | ERROR                    (default INFO)
   BRIDGE_DEPTH               set automatically on children; do not set by hand
-Per harness (prefix AGY_ for antigravity, CLAUDE_ for claude_code)
+Per harness (prefix AGY_ antigravity, CLAUDE_ claude_code, OPENCODE_ opencode, PI_ pi)
   <PREFIX>_BIN                binary name or absolute path
   <PREFIX>_AUTO_APPROVE_FLAGS flags injected when auto_approve=true   (default --dangerously-skip-permissions)
   <PREFIX>_DEFAULT_FLAGS      flags appended to every delegation, e.g. "--model gemini-3.1-pro-high"
@@ -592,7 +592,13 @@ class Harness:
     binary: str
     env_prefix: str
     default_auto_approve: str
-    prompt_is_positional: bool  # claude: -p is boolean and the prompt positional; agy: -p takes the value
+    # Prompt placement. prompt_style "value": the flag carries the prompt (agy `-p <prompt>`);
+    # "positional": the prompt is a positional argument, optionally preceded by print_flag.
+    prompt_style: str
+    print_flag: str | None  # boolean/carrier flag before the prompt ("-p"); None for opencode
+    prompt_last: bool  # place the positional prompt after all flags (opencode/pi)
+    end_of_options: bool  # guard a positional prompt with `--` (pi)
+    subcommand: tuple[str, ...]  # inserted after the binary (opencode: ("run",))
     json_flags: tuple[str, ...]
     output_format_flag: str
     timeout_flag: str | None
@@ -603,8 +609,9 @@ class Harness:
     credential_path: str
     strip_env: tuple[str, ...]
     usage_error_re: str
-    parse_json: Callable[[dict[str, Any]], Outcome]
     parse_auth: Callable[[ProcessResult], tuple[bool, str, str]]
+    parse_json: Callable[[dict[str, Any]], Outcome] | None = None  # single-object JSON (agy/claude)
+    parse_stream: Callable[[str], Outcome | None] | None = None  # NDJSON event stream (opencode/pi)
 
     def binary_setting(self) -> str:
         return _env(f"{self.env_prefix}_BIN", default=self.binary)
@@ -706,6 +713,162 @@ def _auth_claude(result: ProcessResult) -> tuple[bool, str, str]:
     return False, f"NOT authenticated or probe failed (exit {result.returncode}): {detail}", ""
 
 
+def _iter_json_lines(stdout: str):
+    """Yield each JSON object from an NDJSON stream, tolerating blank/non-JSON lines."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def _stringify(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("message", "data", "error", "name"):
+            if isinstance(value.get(key), str):
+                return value[key]
+    return json.dumps(value)[:300]
+
+
+def _pick(usage: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        if name in usage:
+            got = _as_int(usage[name])
+            if got is not None:
+                return got
+    return None
+
+
+def _content_text(content: Any) -> str:
+    """Extract text from an assistant message `content` field (string or list of parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") in ("text", "output_text", None):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _opencode_error_text(err: Any) -> str:
+    """Match opencode's own error rendering: prefer error.data.message, then error.name."""
+    if isinstance(err, dict):
+        data = err.get("data")
+        if isinstance(data, dict) and isinstance(data.get("message"), str):
+            return data["message"]
+        if isinstance(err.get("name"), str):
+            return err["name"]
+    return _stringify(err)
+
+
+def _parse_opencode_stream(stdout: str) -> Outcome | None:
+    """Parse opencode's `run --format json` NDJSON: {type, timestamp, sessionID, ...}."""
+    session_id: str | None = None
+    texts: list[str] = []
+    error: str | None = None
+    seen = False
+    for ev in _iter_json_lines(stdout):
+        seen = True
+        if ev.get("sessionID"):
+            session_id = str(ev["sessionID"])
+        etype = ev.get("type")
+        if etype == "text":
+            part = ev.get("part") or {}
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+        elif etype == "error":
+            error = _opencode_error_text(ev.get("error"))
+    if not seen and session_id is None:
+        return None
+    return Outcome(
+        text="\n".join(texts) or "(no text output)",
+        structured=True,
+        conversation_id=session_id,
+        status="error" if error else "success",
+        harness_error=bool(error),
+        notes=[error] if error else [],
+    )
+
+
+def _parse_pi_stream(stdout: str) -> Outcome | None:
+    """Parse pi's `--mode json` NDJSON: a `session` header then agent/turn/message events."""
+    session_id: str | None = None
+    final: str | None = None
+    usage: dict[str, Any] = {}
+    seen = False
+    for ev in _iter_json_lines(stdout):
+        seen = True
+        etype = ev.get("type")
+        if etype == "session" and ev.get("id"):
+            session_id = str(ev["id"])
+        elif etype == "message_update" and isinstance(ev.get("usage"), dict):
+            usage = ev["usage"]
+        elif etype == "message_end":
+            msg = ev.get("message") or {}
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                text = _content_text(msg.get("content"))
+                if text:
+                    final = text
+        elif etype == "agent_end":
+            for msg in reversed(ev.get("messages") or []):
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    text = _content_text(msg.get("content"))
+                    if text:
+                        final = final or text
+                    break
+    if not seen and session_id is None:
+        return None
+    return Outcome(
+        text=final or "(no text output)",
+        structured=True,
+        conversation_id=session_id,
+        status="success",
+        harness_error=None,
+        tokens_in=_pick(usage, "input_tokens", "inputTokens", "promptTokens", "input"),
+        tokens_out=_pick(usage, "output_tokens", "outputTokens", "completionTokens", "output"),
+    )
+
+
+def _auth_opencode(result: ProcessResult) -> tuple[bool, str, str]:
+    # `opencode auth list` prints one bullet (●) per configured credential.
+    providers = [ln.strip() for ln in result.stdout.splitlines() if "\u25cf" in ln or ln.strip().startswith("\u25cf")]
+    count = result.stdout.count("\u25cf")
+    if result.returncode == 0 and count:
+        return True, f"authenticated ({count} provider credential(s) via `opencode auth list`)", ""
+    detail = (result.stderr or result.stdout).strip()[:400] or "no output"
+    return False, f"NOT authenticated or probe failed (exit {result.returncode}): {detail}", ""
+
+
+def _auth_pi(result: ProcessResult) -> tuple[bool, str, str]:
+    data = _extract_json_object(result.stdout) or {}
+    status = str(data.get("status") or "")
+    if result.returncode == 0 and status == "ready":
+        return True, f"authenticated (provider={data.get('provider', 'google')} ready via `pi auth check`)", ""
+    if status:
+        return (
+            False,
+            f"provider={data.get('provider', 'google')} {status} ({data.get('reason', 'unknown')}); "
+            "pi checks one provider (google by default) — another configured provider may still work",
+            "",
+        )
+    detail = (result.stderr or result.stdout).strip()[:400] or "no output"
+    return False, f"probe failed (exit {result.returncode}): {detail}", ""
+
+
 HARNESSES: dict[str, Harness] = {
     "antigravity": Harness(
         key="antigravity",
@@ -713,7 +876,11 @@ HARNESSES: dict[str, Harness] = {
         binary="agy",
         env_prefix="AGY",
         default_auto_approve="--dangerously-skip-permissions",
-        prompt_is_positional=False,
+        prompt_style="value",  # agy: -p carries the prompt
+        print_flag="-p",
+        prompt_last=False,
+        end_of_options=False,
+        subcommand=(),
         json_flags=("--output-format", "json"),
         output_format_flag="--output-format",
         timeout_flag="--print-timeout",
@@ -724,8 +891,8 @@ HARNESSES: dict[str, Harness] = {
         credential_path="~/.gemini/antigravity-cli/antigravity-oauth-token",
         strip_env=(),
         usage_error_re=r"unexpected argument|unknown flag|flag provided but not defined|usage of agy",
-        parse_json=_parse_agy_json,
         parse_auth=_auth_agy,
+        parse_json=_parse_agy_json,
     ),
     "claude_code": Harness(
         key="claude_code",
@@ -733,18 +900,19 @@ HARNESSES: dict[str, Harness] = {
         binary="claude",
         env_prefix="CLAUDE",
         default_auto_approve="--dangerously-skip-permissions",
-        prompt_is_positional=True,
+        prompt_style="positional",  # claude: -p is boolean, the prompt is positional
+        print_flag="-p",
+        prompt_last=False,
+        end_of_options=False,
+        subcommand=(),
         json_flags=("--output-format", "json"),
         output_format_flag="--output-format",
-        timeout_flag=None,  # no print timeout flag; the bridge timeout is the only limit
+        timeout_flag=None,
         resume_flag="--resume",
         interactive_flags=(),
         prompt_flags=("-p", "--print"),
         auth_probe=("auth", "status", "--json"),
         credential_path="~/.claude/.credentials.json",
-        # Session-identity variables of a parent Claude Code session; the child must not
-        # attach to the parent's session or messaging socket. Settings such as
-        # CLAUDE_CODE_USE_BEDROCK are kept.
         strip_env=(
             "CLAUDECODE",
             "CLAUDE_CODE_SESSION_ID",
@@ -753,19 +921,76 @@ HARNESSES: dict[str, Harness] = {
             "CLAUDE_CODE_ENTRYPOINT",
         ),
         usage_error_re=r"error: unknown option|error: missing required argument|error: option '.*' argument missing|error: too many arguments",
-        parse_json=_parse_claude_json,
         parse_auth=_auth_claude,
+        parse_json=_parse_claude_json,
+    ),
+    "opencode": Harness(
+        key="opencode",
+        label="OpenCode (opencode)",
+        binary="opencode",
+        env_prefix="OPENCODE",
+        default_auto_approve="--auto",  # auto-approve permissions not explicitly denied
+        prompt_style="positional",
+        print_flag=None,  # `opencode run <prompt>`: prompt is a bare positional
+        prompt_last=True,
+        end_of_options=False,
+        subcommand=("run",),
+        json_flags=("--format", "json"),
+        output_format_flag="--format",
+        timeout_flag=None,
+        resume_flag="--session",  # resume a session by id
+        interactive_flags=("-i", "--interactive", "--mini"),
+        prompt_flags=("--prompt",),
+        auth_probe=("auth", "list"),
+        credential_path="~/.local/share/opencode/auth.json",
+        strip_env=(),
+        usage_error_re=r"Unknown argument|Not enough non-option arguments|Missing required argument|Unknown command",
+        parse_auth=_auth_opencode,
+        parse_stream=_parse_opencode_stream,
+    ),
+    "pi": Harness(
+        key="pi",
+        label="pi (pi-coding-agent)",
+        binary="pi",
+        env_prefix="PI",
+        default_auto_approve="--approve",  # trust project-local resources for this headless run
+        prompt_style="positional",
+        print_flag="-p",  # --print: non-interactive
+        prompt_last=True,
+        end_of_options=True,  # guard a dash-leading prompt with `--`
+        subcommand=(),
+        json_flags=("--mode", "json"),
+        output_format_flag="--mode",
+        timeout_flag=None,
+        resume_flag="--session",  # resume by (partial) session UUID
+        interactive_flags=(),
+        prompt_flags=("-p", "--print"),
+        auth_probe=("auth", "check", "--provider", "google", "--json"),
+        credential_path="~/.pi/agent/auth.json",
+        strip_env=(),
+        usage_error_re=r"[Uu]nknown option|[Uu]nknown flag|unexpected argument|[Ii]nvalid option",
+        parse_auth=_auth_pi,
+        parse_stream=_parse_pi_stream,
     ),
 }
 
 
 def parse_outcome(harness: Harness, stdout: str) -> Outcome:
-    data = _extract_json_object(stdout)
-    if data is not None:
+    if harness.parse_stream is not None:  # NDJSON event stream (opencode/pi)
         try:
-            return harness.parse_json(data)
+            outcome = harness.parse_stream(stdout)
+            if outcome is not None:
+                return outcome
         except Exception as exc:  # defensive: never let a schema surprise hide the raw output
-            log.warning("could not parse %s JSON output (%s); falling back to raw text", harness.key, exc)
+            log.warning("could not parse %s event stream (%s); falling back to raw text", harness.key, exc)
+        return Outcome(text=stdout, structured=False)
+    if harness.parse_json is not None:  # single JSON result object (agy/claude)
+        data = _extract_json_object(stdout)
+        if data is not None:
+            try:
+                return harness.parse_json(data)
+            except Exception as exc:
+                log.warning("could not parse %s JSON output (%s); falling back to raw text", harness.key, exc)
     return Outcome(text=stdout, structured=False)
 
 
@@ -848,16 +1073,25 @@ def build_argv(
     extra_flags = harness.default_flags() if extra_flags is None else extra_flags
     user_flags = [*extra_flags, *flags]
 
-    argv = [binary]
+    argv = [binary, *harness.subcommand]
     encoded = prompt.encode("utf-8")
-    via_stdin = len(encoded) > PROMPT_ARG_MAX_BYTES or (harness.prompt_is_positional and prompt.startswith("-"))
-    stdin_data: bytes | None = None
-    if via_stdin:
-        if harness.prompt_is_positional:
-            argv.append("-p")  # boolean print flag; the prompt arrives on stdin
-        stdin_data = encoded
-    else:
-        argv += ["-p", prompt]
+    dash = prompt.startswith("-")
+    # A prompt that cannot go on the command line goes on stdin: too large, or dash-leading
+    # where we cannot guard it with `--` (positional harnesses that read stdin).
+    via_stdin = len(encoded) > PROMPT_ARG_MAX_BYTES or (
+        harness.prompt_style == "positional" and dash and not harness.end_of_options
+    )
+    stdin_data: bytes | None = encoded if via_stdin else None
+
+    if harness.prompt_style == "value":
+        if not via_stdin:
+            argv += [harness.print_flag or "-p", prompt]
+    else:  # positional
+        if harness.print_flag:
+            argv.append(harness.print_flag)
+        if not harness.prompt_last and not via_stdin:
+            argv.append(prompt)
+
     if conversation_id:
         argv += [harness.resume_flag, conversation_id]
     if auto_approve and approve_flags and not _has_flag(user_flags, approve_flags[0]):
@@ -867,6 +1101,11 @@ def build_argv(
     if harness.timeout_flag and not _has_flag(user_flags, harness.timeout_flag):
         argv += [harness.timeout_flag, f"{timeout_seconds + PRINT_TIMEOUT_MARGIN}s"]
     argv += user_flags
+
+    if harness.prompt_last and not via_stdin:
+        if harness.end_of_options:
+            argv.append("--")
+        argv.append(prompt)
     return argv, stdin_data
 
 
@@ -1281,7 +1520,7 @@ async def health(harness: Harness) -> str:
 mcp = _ServerImpl(
     SERVER_NAME,
     instructions=(
-        "Execution bridge to headless coding harnesses: Antigravity (agy) and Claude Code (claude). "
+        "Execution bridge to headless coding harnesses: Antigravity (agy), Claude Code (claude), OpenCode (opencode) and pi. "
         "Call check_<harness>_health once before the first delegation. delegate_to_<harness> runs ONE "
         "headless task and returns a report starting with [SUCCESS], [ROADBLOCK / FAILURE], [TIMEOUT_ERROR] "
         "or [INVALID_ARGUMENT]; branch on that prefix. Every report carries a Conversation ID: pass it back as "
@@ -1407,6 +1646,8 @@ def enabled_harness_keys() -> list[str]:
 REGISTERED_TOOLS = {key: _register_harness(HARNESSES[key]) for key in enabled_harness_keys()}
 delegate_to_antigravity, check_antigravity_health = REGISTERED_TOOLS.get("antigravity", (None, None))
 delegate_to_claude_code, check_claude_code_health = REGISTERED_TOOLS.get("claude_code", (None, None))
+delegate_to_opencode, check_opencode_health = REGISTERED_TOOLS.get("opencode", (None, None))
+delegate_to_pi, check_pi_health = REGISTERED_TOOLS.get("pi", (None, None))
 
 
 # ---------------------------------------------------------------------------

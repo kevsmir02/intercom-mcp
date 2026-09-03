@@ -38,6 +38,8 @@ class CliFixture(unittest.TestCase):
         self.fake_dir.mkdir()
         self.fake_agy = self._install_fake("agy")
         self.fake_claude = self._install_fake("claude")
+        self.fake_opencode = self._install_fake("opencode")
+        self.fake_pi = self._install_fake("pi")
         self.bin_dir = self.tmp / "bin"
         self.mcp_log = self.tmp / "mcp.log"
         self.mcp_marker = self.tmp / "mcp.marker"
@@ -64,6 +66,8 @@ class CliFixture(unittest.TestCase):
                 "INTERCOM_BIN_DIR": str(self.bin_dir),
                 "AGY_BIN": str(self.fake_agy),
                 "CLAUDE_BIN": str(self.fake_claude),
+                "OPENCODE_BIN": str(self.fake_opencode),
+                "PI_BIN": str(self.fake_pi),
                 "FAKE_MCP_LOG": str(self.mcp_log),
                 "FAKE_MCP_MARKER": str(self.mcp_marker),
                 "BRIDGE_KILL_GRACE_SECONDS": "1",
@@ -147,8 +151,8 @@ class TestSetup(CliFixture):
         result = self.run_cli("setup", "--yes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         cfg = json.loads(self.config_json.read_text())
-        self.assertEqual(cfg["harnesses"], ["antigravity", "claude_code"])  # both fakes resolve
-        self.assertEqual(cfg["orchestrators"], ["claude_code"])  # no opencode binary or config dir
+        self.assertEqual(cfg["harnesses"], ["antigravity", "claude_code", "opencode", "pi"])  # all fakes resolve
+        self.assertEqual(cfg["orchestrators"], ["claude_code"])  # opencode scrubbed from PATH, no config dir
         self.assertFalse(self.opencode_json.exists())
         self.assertIn("mcp add", self.mcp_log.read_text())
         self.assertTrue(self.skill_link.is_symlink())

@@ -40,12 +40,15 @@ AGY = bridge.HARNESSES["antigravity"]
 CLAUDE = bridge.HARNESSES["claude_code"]
 
 FAKE_HARNESS = r'''#!/usr/bin/env python3
-"""Fake harness binary for test_bridge.py: acts as `agy` or `claude` depending on its file name."""
+# Fake harness binary for tests: behaves as agy / claude / opencode / pi by its file name.
 import json, os, signal, subprocess, sys
 
 name = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
+is_agy = name == "agy"
 is_claude = name == "claude"
+is_opencode = name == "opencode"
+is_pi = name == "pi"
 
 
 def out(text):
@@ -54,16 +57,15 @@ def out(text):
 
 
 if args[:1] == ["--version"]:
-    out("9.9.9-fake (Claude Code)\n" if is_claude else "9.9.9-fake\n")
+    out({"claude": "9.9.9-fake (Claude Code)", "opencode": "9.9.9-fake",
+         "pi": "9.9.9-fake", "agy": "9.9.9-fake"}[name] + "\n")
     sys.exit(0)
-if not is_claude and args[:1] == ["models"]:
+
+if is_agy and args[:1] == ["models"]:
     if os.environ.get("FAKE_AUTH_FAIL"):
-        sys.stderr.write("Error: not authenticated. Run 'agy' interactively to log in.\n")
-        sys.exit(1)
-    out("Fetching available models...\nfake-model-high\tFake Model (High)\nfake-model-low\tFake Model (Low)\n")
-    sys.exit(0)
+        sys.stderr.write("Error: not authenticated. Run 'agy' interactively to log in.\n"); sys.exit(1)
+    out("Fetching available models...\nfake-model-high\tFake Model (High)\nfake-model-low\tFake Model (Low)\n"); sys.exit(0)
 if is_claude and args[:1] == ["mcp"]:
-    # `claude mcp add|remove|get` used by intercom.py; a marker file stands in for the registration.
     log, marker = os.environ.get("FAKE_MCP_LOG"), os.environ.get("FAKE_MCP_MARKER")
     if log:
         with open(log, "a") as fh:
@@ -80,46 +82,57 @@ if is_claude and args[:1] == ["mcp"]:
         sys.exit(0 if marker and os.path.exists(marker) else 1)
     sys.exit(0)
 if is_claude and args[:2] == ["auth", "status"]:
-    out(json.dumps({
-        "loggedIn": not os.environ.get("FAKE_AUTH_FAIL"), "authMethod": "claude.ai", "apiProvider": "firstParty",
-        "subscriptionType": "max", "email": "secret-email@example.com", "orgId": "secret-org",
-    }) + "\n")
+    out(json.dumps({"loggedIn": not os.environ.get("FAKE_AUTH_FAIL"), "authMethod": "claude.ai",
+                    "apiProvider": "firstParty", "subscriptionType": "max",
+                    "email": "secret-email@example.com", "orgId": "secret-org"}) + "\n")
     sys.exit(0)
+if is_opencode and args[:2] == ["auth", "list"]:
+    if os.environ.get("FAKE_AUTH_FAIL"):
+        sys.stderr.write("no credentials\n"); sys.exit(1)
+    out("Credentials ~/.local/share/opencode/auth.json\n●  OpenCode Go  api\n"); sys.exit(0)
+if is_pi and args[:2] == ["auth", "check"]:
+    ready = not os.environ.get("FAKE_AUTH_FAIL")
+    out(json.dumps({"status": "ready" if ready else "not_ready", "provider": "google",
+                    "reason": "" if ready else "credentials_not_configured"}) + "\n"); sys.exit(0)
 
-VALUE_OPTS = {"--output-format", "--print-timeout", "--model", "--conversation", "--resume", "--effort",
-              "--add-dir", "--max-turns", "--mode", "--permission-mode"}
+VALUE_OPTS = {"--output-format", "--print-timeout", "--model", "--conversation", "--resume",
+              "--session", "--session-id", "--effort", "--add-dir", "--max-turns", "--mode",
+              "--format", "--permission-mode", "--provider", "--api-key", "--system-prompt",
+              "--thinking", "--agent", "--variant", "--title", "--dir"}
 prompt = None
 source = "stdin"
 resume = None
+positionals = []
+after_ddash = False
 i = 0
 while i < len(args):
     a = args[i]
+    if a == "--" and not after_ddash:
+        after_ddash = True; i += 1; continue
+    if after_ddash:
+        positionals.append(a); i += 1; continue
     if a in ("-p", "--print", "--prompt"):
-        if is_claude:          # boolean flag; the prompt is positional
-            i += 1
-            continue
-        prompt, source = args[i + 1], "arg"
-        i += 2
-        continue
-    if a in ("--conversation", "--resume"):
-        resume = args[i + 1]
-        i += 2
-        continue
+        if is_agy:
+            prompt, source = args[i + 1], "arg"; i += 2; continue
+        i += 1; continue
+    if a in ("--conversation", "--resume", "--session", "--session-id"):
+        resume = args[i + 1]; i += 2; continue
     if a in VALUE_OPTS:
-        i += 2
-        continue
+        i += 2; continue
     if a.startswith("-"):
-        i += 1
-        continue
-    if is_claude and prompt is None:
-        prompt, source = a, "arg"
-    i += 1
+        i += 1; continue
+    if a == "run" and is_opencode and not positionals and prompt is None:
+        i += 1; continue
+    positionals.append(a); i += 1
 if prompt is None:
-    prompt = sys.stdin.read()
+    if positionals:
+        prompt, source = positionals[-1], "arg"
+    else:
+        prompt = sys.stdin.read()
 
-shown_args = ["<PROMPT>" if a == prompt else a for a in args]
-lines = [
-    "FAKE_ARGS: " + " ".join(shown_args),
+shown = ["<PROMPT>" if a == prompt else a for a in args]
+text = "\n".join([
+    "FAKE_ARGS: " + " ".join(shown),
     "FAKE_PROMPT_SOURCE: " + source,
     "FAKE_PROMPT_LEN: " + str(len(prompt)),
     "FAKE_ENV_MARKER: " + os.environ.get("FAKE_ENV_MARKER", "unset"),
@@ -127,8 +140,7 @@ lines = [
     "FAKE_DEPTH: " + os.environ.get("BRIDGE_DEPTH", "unset"),
     "FAKE_CLAUDECODE: " + os.environ.get("CLAUDECODE", "unset"),
     "FAKE_RESUME: " + (resume or "none"),
-]
-text = "\n".join(lines) + "\nPONG: " + prompt[:200]
+]) + "\nPONG: " + prompt[:200]
 
 if "__FAIL__" in prompt:
     out("collecting tests ... running\nFAILED tests/test_calc.py::test_add - AssertionError\n")
@@ -141,14 +153,12 @@ if "__HANG__" in prompt:
     child = subprocess.Popen(["sleep", "300"], preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN))
     with open(os.environ.get("FAKE_PIDFILE", os.devnull), "w") as fh:
         fh.write(str(os.getpid()) + "\n" + str(child.pid) + "\n")
-    child.wait()
-    sys.exit(0)
-if "__PLAIN__" in prompt:
-    out("plain text output, no json\n" + text + "\n")
-    sys.exit(0)
+    child.wait(); sys.exit(0)
 if "__SLOW__" in prompt:
     import time as _t
     _t.sleep(float(os.environ.get("FAKE_SLEEP", "0.6")))
+if "__PLAIN__" in prompt:
+    out("plain text output, no json\n" + text + "\n"); sys.exit(0)
 if "__WRITE__:" in prompt:
     target = prompt.split("__WRITE__:", 1)[1].split()[0]
     with open(target, "w") as fh:
@@ -159,24 +169,36 @@ if "__EDIT__:" in prompt:
     with open(target, "a") as fh:
         fh.write("appended by fake harness\n")
     text += "\nedited " + target
-
 status_error = "__STATUSERR__" in prompt
+
+if is_opencode:
+    if status_error:
+        out(json.dumps({"type": "error", "timestamp": 1, "sessionID": "oc-sess-1",
+                        "error": {"name": "ProviderError", "data": {"message": "model refused"}}}) + "\n")
+        sys.exit(0)
+    out(json.dumps({"type": "step_start", "timestamp": 1, "sessionID": "oc-sess-1", "part": {"type": "step-start"}}) + "\n")
+    out(json.dumps({"type": "text", "timestamp": 2, "sessionID": "oc-sess-1", "part": {"type": "text", "text": text}}) + "\n")
+    out(json.dumps({"type": "step_finish", "timestamp": 3, "sessionID": "oc-sess-1", "part": {"type": "step-finish"}}) + "\n")
+    sys.exit(0)
+if is_pi:
+    msg = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+    out(json.dumps({"type": "session", "version": 3, "id": "pi-sess-1", "cwd": os.getcwd()}) + "\n")
+    out(json.dumps({"type": "message_update", "usage": {"input_tokens": 11, "output_tokens": 4}}) + "\n")
+    out(json.dumps({"type": "message_end", "message": msg}) + "\n")
+    out(json.dumps({"type": "agent_end", "messages": [msg]}) + "\n")
+    sys.exit(0)
 if is_claude:
-    payload = {
-        "type": "result", "subtype": "error_during_execution" if status_error else "success",
-        "is_error": status_error, "result": text, "session_id": "claude-sess-456", "num_turns": 2,
-        "total_cost_usd": 0.0123,
-        "usage": {"input_tokens": 2, "output_tokens": 7, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 8},
-        "modelUsage": {"fake-opus": {}},
-        "permission_denials": [{"tool_name": "Bash"}] if "__DENIED__" in prompt else [],
-        "terminal_reason": "completed",
-    }
+    payload = {"type": "result", "subtype": "error_during_execution" if status_error else "success",
+               "is_error": status_error, "result": text, "session_id": "claude-sess-456", "num_turns": 2,
+               "total_cost_usd": 0.0123,
+               "usage": {"input_tokens": 2, "output_tokens": 7, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 8},
+               "modelUsage": {"fake-opus": {}},
+               "permission_denials": [{"tool_name": "Bash"}] if "__DENIED__" in prompt else [],
+               "terminal_reason": "completed"}
 else:
-    payload = {
-        "conversation_id": "agy-conv-123", "status": "ERROR" if status_error else "SUCCESS", "response": text,
-        "duration_seconds": 0.1, "num_turns": 2,
-        "usage": {"input_tokens": 100, "output_tokens": 7, "total_tokens": 107},
-    }
+    payload = {"conversation_id": "agy-conv-123", "status": "ERROR" if status_error else "SUCCESS", "response": text,
+               "duration_seconds": 0.1, "num_turns": 2,
+               "usage": {"input_tokens": 100, "output_tokens": 7, "total_tokens": 107}}
 out(json.dumps(payload) + "\n")
 '''
 
@@ -204,7 +226,7 @@ def input_schema(tool) -> dict:
 
 
 CONFIG_KEYS = {"AGY_BIN", "AGY_AUTO_APPROVE_FLAGS", "AGY_DEFAULT_FLAGS", "CLAUDE_BIN", "CLAUDE_AUTO_APPROVE_FLAGS",
-               "CLAUDE_DEFAULT_FLAGS", "CLAUDECODE"}
+               "CLAUDE_DEFAULT_FLAGS", "CLAUDECODE", "OPENCODE_BIN", "PI_BIN"}
 
 
 class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
@@ -216,6 +238,8 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
         self.fake_dir.mkdir()
         self.fake_agy = self._install_fake("agy")
         self.fake_claude = self._install_fake("claude")
+        self.fake_opencode = self._install_fake("opencode")
+        self.fake_pi = self._install_fake("pi")
         self.workdir = self.tmp / "project"
         self.workdir.mkdir()
 
@@ -238,6 +262,8 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
             {
                 "AGY_BIN": str(self.fake_agy),
                 "CLAUDE_BIN": str(self.fake_claude),
+                "OPENCODE_BIN": str(self.fake_opencode),
+                "PI_BIN": str(self.fake_pi),
                 "BRIDGE_KILL_GRACE_SECONDS": "1",
                 "BRIDGE_LOG_LEVEL": "WARNING",
             }
@@ -278,9 +304,14 @@ class TestDiscovery(BridgeTestCase):
             tools = {t.name: t for t in (await session.list_tools()).tools}
         self.assertEqual(
             set(tools),
-            {"delegate_to_antigravity", "check_antigravity_health", "delegate_to_claude_code", "check_claude_code_health"},
+            {
+                "delegate_to_antigravity", "check_antigravity_health",
+                "delegate_to_claude_code", "check_claude_code_health",
+                "delegate_to_opencode", "check_opencode_health",
+                "delegate_to_pi", "check_pi_health",
+            },
         )
-        for name in ("delegate_to_antigravity", "delegate_to_claude_code"):
+        for name in ("delegate_to_antigravity", "delegate_to_claude_code", "delegate_to_opencode", "delegate_to_pi"):
             schema = input_schema(tools[name])
             props = schema["properties"]
             self.assertEqual(set(schema["required"]), {"prompt", "working_dir"})
@@ -290,7 +321,7 @@ class TestDiscovery(BridgeTestCase):
             self.assertEqual(props["timeout_seconds"]["default"], 900)
             self.assertEqual(props["include_diff"]["default"], False)
             self.assertIn("Conversation ID", tools[name].description)
-        for name in ("check_antigravity_health", "check_claude_code_health"):
+        for name in ("check_antigravity_health", "check_claude_code_health", "check_opencode_health", "check_pi_health"):
             self.assertFalse(input_schema(tools[name]).get("required"))
             self.assertIn("[HEALTH: READY]", tools[name].description)
 
@@ -547,6 +578,94 @@ class TestClaudeCodeExecution(BridgeTestCase):
 
 
 # ---------------------------------------------------------------------------
+# OpenCode execution (NDJSON event stream)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestOpenCodeExecution(BridgeTestCase):
+    async def test_success_parses_event_stream_and_uses_run_subcommand(self) -> None:
+        async with self.session(FAKE_ENV_MARKER="oc-ok") as session:
+            text = await self.call(session, "delegate_to_opencode", prompt="say hello", flags=["--model", "opencode/glm-5.3"])
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("Harness: opencode", text)
+        self.assertIn("PONG: say hello", text)
+        self.assertIn('Conversation ID: oc-sess-1  (pass conversation_id="oc-sess-1" to delegate_to_opencode', text)
+        args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
+        self.assertTrue(args_line.startswith("FAKE_ARGS: run "), args_line)  # `run` subcommand first
+        self.assertIn("--auto", args_line)
+        self.assertIn("--format json", args_line)
+        self.assertNotIn("-p ", args_line)  # opencode has no -p; prompt is positional
+        self.assertTrue(args_line.rstrip().endswith("<PROMPT>"), args_line)  # prompt is last
+        self.assertIn("--model opencode/glm-5.3", args_line)
+        self.assertIn("FAKE_ENV_MARKER: oc-ok", text)
+
+    async def test_conversation_id_maps_to_session_flag(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_opencode", prompt="fix it", conversation_id="oc-sess-1")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("--session oc-sess-1", text)
+        self.assertIn("FAKE_RESUME: oc-sess-1", text)
+
+    async def test_error_event_is_a_roadblock(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_opencode", prompt="__STATUSERR__ do it")
+        self.assertTrue(text.startswith("[ROADBLOCK / FAILURE]"), text)
+        self.assertIn("model refused", text)
+
+    async def test_dash_prompt_goes_via_stdin(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_opencode", prompt="--not-a-flag rename foo")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("FAKE_PROMPT_SOURCE: stdin", text)
+        self.assertIn("piped via stdin", text)
+
+    async def test_timeout_kills_opencode_tree(self) -> None:
+        pidfile = self.tmp / "pids.txt"
+        async with self.session(FAKE_PIDFILE=str(pidfile)) as session:
+            text = await self.call(session, "delegate_to_opencode", prompt="never finish __HANG__", timeout_seconds=2)
+        self.assertTrue(text.startswith("[TIMEOUT_ERROR]"), text)
+        pids = [int(p) for p in pidfile.read_text().split()]
+        self.assertEqual(_wait_dead(pids), [], "opencode process tree survived the timeout")
+
+
+# ---------------------------------------------------------------------------
+# pi execution (NDJSON event stream)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestPiExecution(BridgeTestCase):
+    async def test_success_parses_event_stream_with_usage_and_guards_prompt(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_pi", prompt="say hello", flags=["--provider", "anthropic"])
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("Harness: pi", text)
+        self.assertIn("PONG: say hello", text)
+        self.assertIn('Conversation ID: pi-sess-1  (pass conversation_id="pi-sess-1" to delegate_to_pi', text)
+        self.assertIn("tokens in/out=11/4", text)
+        args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
+        self.assertTrue(args_line.startswith("FAKE_ARGS: -p "), args_line)
+        self.assertIn("--approve", args_line)
+        self.assertIn("--mode json", args_line)
+        self.assertIn("-- <PROMPT>", args_line)  # end-of-options guard before the prompt
+
+    async def test_conversation_id_maps_to_session_flag(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_pi", prompt="fix it", conversation_id="pi-sess-1")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("--session pi-sess-1", text)
+        self.assertIn("FAKE_RESUME: pi-sess-1", text)
+
+    async def test_dash_prompt_is_guarded_not_stdin(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_pi", prompt="--not-a-flag rename foo")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("FAKE_PROMPT_SOURCE: arg", text)  # pi guards with `--`, no stdin needed
+        self.assertIn("-- <PROMPT>", text)
+
+
+# ---------------------------------------------------------------------------
 # Depth guard
 # ---------------------------------------------------------------------------
 
@@ -613,6 +732,23 @@ class TestHealth(BridgeTestCase):
             self.assertTrue(text.startswith("[HEALTH: UNAVAILABLE]"), text)
             self.assertIn("not found", text)
             self.assertIn(var, text)
+
+    async def test_opencode_ready(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "check_opencode_health")
+        self.assertTrue(text.startswith("[HEALTH: READY]"), text)
+        self.assertIn("Version: 9.9.9-fake", text)
+        self.assertIn("provider credential(s) via `opencode auth list`", text)
+
+    async def test_pi_ready_and_degraded(self) -> None:
+        async with self.session() as session:
+            ready = await self.call(session, "check_pi_health")
+        self.assertTrue(ready.startswith("[HEALTH: READY]"), ready)
+        self.assertIn("provider=google ready", ready)
+        async with self.session(FAKE_AUTH_FAIL="1") as session:
+            degraded = await self.call(session, "check_pi_health")
+        self.assertTrue(degraded.startswith("[HEALTH: DEGRADED]"), degraded)
+        self.assertIn("credentials_not_configured", degraded)
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +823,54 @@ class TestHelpers(unittest.TestCase):
         raw = bridge.parse_outcome(AGY, "just text")
         self.assertEqual((raw.structured, raw.text, raw.conversation_id), (False, "just text", None))
         self.assertIsNone(bridge._extract_json_object("not { json"))
+
+    def test_build_argv_opencode_and_pi(self) -> None:
+        OC, PI = bridge.HARNESSES["opencode"], bridge.HARNESSES["pi"]
+        argv, stdin = bridge.build_argv(OC, "opencode", "do it", ["--model", "x"], True, 60, "s1", approve_flags=["--auto"], extra_flags=[])
+        self.assertIsNone(stdin)
+        self.assertEqual(argv[:2], ["opencode", "run"])
+        self.assertEqual(argv[-1], "do it")  # prompt last, no `--`
+        self.assertIn("--session", argv)
+        self.assertEqual(argv[argv.index("--session") + 1], "s1")
+        self.assertIn("--auto", argv)
+        self.assertEqual(argv[argv.index("--format") + 1], "json")
+        argv, stdin = bridge.build_argv(PI, "pi", "do it", [], True, 60, "u1", approve_flags=["--approve"], extra_flags=[])
+        self.assertEqual(argv[:2], ["pi", "-p"])
+        self.assertEqual(argv[-2:], ["--", "do it"])  # end-of-options guard then prompt
+        self.assertEqual(argv[argv.index("--session") + 1], "u1")
+        self.assertEqual(argv[argv.index("--mode") + 1], "json")
+        # opencode dash prompt -> stdin; pi dash prompt -> guarded, no stdin
+        _, oc_stdin = bridge.build_argv(OC, "opencode", "-dash", [], True, 60, approve_flags=["--auto"], extra_flags=[])
+        self.assertEqual(oc_stdin, b"-dash")
+        pi_argv, pi_stdin = bridge.build_argv(PI, "pi", "-dash", [], True, 60, approve_flags=["--approve"], extra_flags=[])
+        self.assertIsNone(pi_stdin)
+        self.assertEqual(pi_argv[-2:], ["--", "-dash"])
+
+    def test_parse_opencode_stream(self) -> None:
+        stream = "\n".join([
+            '{"type":"step_start","sessionID":"oc9","part":{"type":"step-start"}}',
+            '{"type":"text","sessionID":"oc9","part":{"type":"text","text":"Done."}}',
+            '{"type":"step_finish","sessionID":"oc9"}',
+        ])
+        oc = bridge.parse_outcome(bridge.HARNESSES["opencode"], stream)
+        self.assertEqual((oc.conversation_id, oc.text, oc.harness_error, oc.structured), ("oc9", "Done.", False, True))
+        err = bridge.parse_outcome(bridge.HARNESSES["opencode"], '{"type":"error","sessionID":"oc9","error":{"data":{"message":"boom"}}}')
+        self.assertTrue(err.harness_error)
+        self.assertIn("boom", err.notes[0])
+        self.assertFalse(bridge.parse_outcome(bridge.HARNESSES["opencode"], "not json at all").structured)
+
+    def test_parse_pi_stream(self) -> None:
+        stream = "\n".join([
+            '{"type":"session","version":3,"id":"pi9","cwd":"/x"}',
+            '{"type":"message_update","usage":{"input_tokens":5,"output_tokens":2}}',
+            '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hi there"}]}}',
+            '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Hi there"}]}]}',
+        ])
+        pi = bridge.parse_outcome(bridge.HARNESSES["pi"], stream)
+        self.assertEqual((pi.conversation_id, pi.text, pi.tokens_in, pi.tokens_out, pi.structured), ("pi9", "Hi there", 5, 2, True))
+        # string content also works
+        one = bridge.parse_outcome(bridge.HARNESSES["pi"], '{"type":"message_end","message":{"role":"assistant","content":"plain"}}')
+        self.assertEqual(one.text, "plain")
 
     def test_validate_working_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

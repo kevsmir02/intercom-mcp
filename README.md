@@ -8,6 +8,8 @@ reviewable report back. Two harnesses are wired in:
 | --- | --- | --- |
 | `antigravity` | Google Antigravity CLI `agy` | `delegate_to_antigravity`, `check_antigravity_health` |
 | `claude_code` | Anthropic Claude Code `claude` | `delegate_to_claude_code`, `check_claude_code_health` |
+| `opencode` | OpenCode `opencode` | `delegate_to_opencode`, `check_opencode_health` |
+| `pi` | pi coding agent `pi` | `delegate_to_pi`, `check_pi_health` |
 
 Each harness runs in its JSON print mode, so every report carries the harness's conversation ID.
 Passing it back as `conversation_id` resumes that session with its full context: a review-fix round
@@ -140,6 +142,18 @@ Each report also carries `Conversation ID` and `Harness stats` (status, turns, t
   auto-approve is `--dangerously-skip-permissions`; no print timeout flag; `claude auth status --json` is
   the auth probe; resume is `--resume <id>`. The bridge hides the parent session's `CLAUDECODE` and
   `CLAUDE_CODE_SESSION_ID`-style variables from the child so it starts as an independent session.
+- `opencode` (1.18.x): headless mode is `opencode run <prompt>` (or the prompt on stdin); auto-approve is
+  `--auto`; structured output is `--format json`, a newline-delimited event stream whose events carry a
+  `sessionID` and completed-text parts; the auth probe is `opencode auth list`; resume is `--session <id>`.
+- `pi` (0.84.x): headless mode is `pi -p` with the prompt guarded by `--`; auto-approve (project trust) is
+  `--approve`; structured output is `--mode json`, a JSON-lines event stream with a `session` header and a
+  final `message_end`; the auth probe is `pi auth check --provider <name> --json`; resume is `--session <id>`.
+  pi defaults to the `google` provider and needs provider credentials configured.
+
+The `agy` and `claude` adapters are verified end to end on this project. The `opencode` and `pi` command
+construction and JSON schemas are verified from each CLI's `--help`, source, and docs, and exercised against
+faithful fake binaries in the test suite; confirm them with a real `check_<harness>_health` and one small
+delegation in your environment.
 
 ## Environment variables
 
@@ -147,9 +161,9 @@ Set these in the orchestrator's environment block, or let `intercom setup` manag
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INTERCOM_HARNESSES` | all | Comma-separated harness keys whose tools are exposed |
-| `AGY_BIN` / `CLAUDE_BIN` | `agy` / `claude` | Binary name or absolute path |
-| `AGY_AUTO_APPROVE_FLAGS` / `CLAUDE_AUTO_APPROVE_FLAGS` | `--dangerously-skip-permissions` | Injected when `auto_approve` is true |
+| `INTERCOM_HARNESSES` | all | Comma-separated harness keys to expose: `antigravity`, `claude_code`, `opencode`, `pi` |
+| `<H>_BIN` (`AGY_`, `CLAUDE_`, `OPENCODE_`, `PI_`) | the CLI name | Binary name or absolute path per harness |
+| `<H>_AUTO_APPROVE_FLAGS` | per harness | Injected when `auto_approve` is true (agy/claude `--dangerously-skip-permissions`, opencode `--auto`, pi `--approve`) |
 | `AGY_DEFAULT_FLAGS` / `CLAUDE_DEFAULT_FLAGS` | (empty) | Flags appended to every delegation, e.g. `--model sonnet` |
 | `BRIDGE_MAX_DEPTH` | `1` | Delegation depth allowed below this server (loop guard) |
 | `BRIDGE_MAX_OUTPUT_CHARS` | `60000` | Per-stream cap in tool results |

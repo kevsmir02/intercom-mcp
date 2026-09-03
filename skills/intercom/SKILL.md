@@ -1,6 +1,6 @@
 ---
 name: intercom
-description: Delegate implementation, refactoring or test-writing work to a headless coding harness (Antigravity `agy` or Claude Code) through the intercom MCP tools, then run the review-fix loop on the report. Use when a task is scoped enough to hand off, when this session should spare its own context or quota, or when a delegation report has come back and needs review.
+description: Delegate implementation, refactoring or test-writing work to a headless coding harness (Antigravity `agy`, Claude Code, OpenCode, or pi) through the intercom MCP tools, then run the review-fix loop on the report. Use when a task is scoped enough to hand off, when this session should spare its own context or quota, or when a delegation report has come back and needs review.
 ---
 
 # Intercom: delegate, review, fix
@@ -45,9 +45,12 @@ tools are `delegate_to_antigravity`, `delegate_to_claude_code` and the matching
 
 - `antigravity`: Gemini, Claude and open models on the Google Antigravity subscription.
 - `claude_code`: Claude models on the Claude subscription or API key.
+- `opencode`: whichever provider OpenCode is configured with (e.g. OpenCode Go).
+- `pi`: the pi coding agent, provider configurable (Google by default).
 
-Pick by remaining quota and by which harness already holds context on the codebase. On a
-quota roadblock, resend the same brief to the other harness.
+Only harnesses whose tools appear are enabled; call the matching `check_<harness>_health`
+first. Pick by remaining quota and by which harness already holds context on the codebase.
+On a quota roadblock, resend the same brief to another harness.
 
 ## Guardrails
 
