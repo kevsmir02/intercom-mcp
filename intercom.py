@@ -40,6 +40,11 @@ HERE = Path(__file__).resolve().parent
 SERVER_KEY = "intercom"
 SKILL_NAME = "intercom"
 SKILL_SRC = HERE / "skills" / SKILL_NAME
+AGENT_NAME = "intercom-delegate"
+AGENT_SRC = {
+    "claude_code": HERE / "agents" / "claude" / f"{AGENT_NAME}.md",
+    "opencode": HERE / "agents" / "opencode" / f"{AGENT_NAME}.md",
+}
 HARNESS_KEYS = ("antigravity", "claude_code", "opencode", "pi")
 HARNESS_LABELS = {
     "antigravity": "Antigravity CLI (agy)",
@@ -95,6 +100,14 @@ def opencode_skills_dir() -> Path:
     return xdg_config_home() / "opencode" / "skills"
 
 
+def claude_agents_dir() -> Path:
+    return home() / ".claude" / "agents"
+
+
+def opencode_agent_dir() -> Path:
+    return xdg_config_home() / "opencode" / "agent"
+
+
 def venv_python() -> str:
     candidate = HERE / ".venv" / "bin" / "python"
     return str(candidate) if candidate.exists() else sys.executable
@@ -109,6 +122,7 @@ def default_config() -> dict[str, Any]:
         "default_flags": {},
         "max_depth": 1,
         "skill_links": [],
+        "agent_links": [],
     }
 
 
@@ -470,6 +484,37 @@ def unlink_skill(target: Path) -> str:
     return f"no intercom skill link at {target}"
 
 
+def agent_targets(orchestrators: list[str]) -> list[tuple[Path, Path]]:
+    """The delegating subagent, per orchestrator, as (link target, source file). Formats differ
+    (Claude uses mcp__intercom__* tool names, OpenCode uses intercom_*), so each gets its own file."""
+    pairs: list[tuple[Path, Path]] = []
+    if "claude_code" in orchestrators:
+        pairs.append((claude_agents_dir() / f"{AGENT_NAME}.md", AGENT_SRC["claude_code"]))
+    if "opencode" in orchestrators:
+        pairs.append((opencode_agent_dir() / f"{AGENT_NAME}.md", AGENT_SRC["opencode"]))
+    return pairs
+
+
+def link_agent(target: Path, src: Path) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        if target.resolve() == src.resolve():
+            return f"delegating subagent already linked at {target}"
+        target.unlink()
+    elif target.exists():
+        return f"{target} exists and is not a symlink; left untouched (delete it and rerun setup to link)"
+    target.symlink_to(src)
+    return f"linked delegating subagent at {target}"
+
+
+def unlink_agent(target: Path) -> str:
+    known = {src.resolve() for src in AGENT_SRC.values()}
+    if target.is_symlink() and target.resolve() in known:
+        target.unlink()
+        return f"removed delegating subagent link {target}"
+    return f"no intercom delegating subagent link at {target}"
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -593,13 +638,22 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if message.startswith(("linked", "skill already")):
             links.append(str(target))
     cfg["skill_links"] = links
+    agent_links: list[str] = []
+    for target, src in agent_targets(orchestrators):
+        message = link_agent(target, src)
+        say(message)
+        if message.startswith(("linked", "delegating subagent already")):
+            agent_links.append(str(target))
+    cfg["agent_links"] = agent_links
     say(f"configuration saved to {save_config(cfg)}")
 
     print()
     print("Done. Next steps:")
     print("  1. Restart the orchestrator so it picks up the new MCP server and skill.")
     print(f"  2. Ask it to run check_{harnesses[0]}_health; expect a report starting with [HEALTH: READY].")
-    print("  3. `intercom doctor` repeats these checks from the shell at any time.")
+    print("  3. Ask it to \"delegate <task> to <harness>\"; the intercom-delegate subagent runs the")
+    print("     delegation and returns a summary, keeping the main thread's context clean.")
+    print("  4. `intercom doctor` repeats these checks from the shell at any time.")
     if not launcher_on_path():
         print(f"  4. Put {bin_dir()} on PATH so `intercom` resolves in new shells.")
     return 1 if problems else 0
@@ -653,6 +707,15 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         target = Path(link)
         report(target.is_symlink() and target.resolve() == SKILL_SRC.resolve(), f"skill linked at {target}")
 
+    print("subagent")
+    agent_links = cfg.get("agent_links") or []
+    known = {src.resolve() for src in AGENT_SRC.values()}
+    if not agent_links:
+        report(False, "no delegating subagent link recorded; run `intercom setup`")
+    for link in agent_links:
+        target = Path(link)
+        report(target.is_symlink() and target.resolve() in known, f"delegating subagent linked at {target}")
+
     print()
     print("all checks passed" if not problems else f"{problems} check(s) failed")
     return 1 if problems else 0
@@ -694,6 +757,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         say(unregister_claude())
     for link in cfg.get("skill_links") or [str(t) for t in skill_targets(cfg.get("orchestrators", []))]:
         say(unlink_skill(Path(link)))
+    for link in cfg.get("agent_links") or [str(t) for t, _ in agent_targets(cfg.get("orchestrators", []))]:
+        say(unlink_agent(Path(link)))
     if launcher_path().exists():
         launcher_path().unlink()
         say(f"removed launcher {launcher_path()}")

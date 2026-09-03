@@ -52,6 +52,12 @@ Only harnesses whose tools appear are enabled; call the matching `check_<harness
 first. Pick by remaining quota and by which harness already holds context on the codebase.
 On a quota roadblock, resend the same brief to another harness.
 
+## Keeping the main context clean
+
+For a long session, run this loop inside the `intercom-delegate` subagent instead of the main
+thread: spawn it with the task, let it delegate, review and fix, and return a short summary. The
+verbose report and diff stay in the subagent's context. `intercom setup` installs that subagent.
+
 ## Guardrails
 
 - Keep secrets out of the brief: the harness inherits the environment and stores its

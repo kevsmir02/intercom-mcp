@@ -106,6 +106,14 @@ class CliFixture(unittest.TestCase):
     def skill_link(self) -> Path:
         return self.home / ".claude" / "skills" / "intercom"
 
+    @property
+    def claude_agent_link(self) -> Path:
+        return self.home / ".claude" / "agents" / "intercom-delegate.md"
+
+    @property
+    def opencode_agent_link(self) -> Path:
+        return self.home / ".config" / "opencode" / "agent" / "intercom-delegate.md"
+
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX environment")
 class TestSetup(CliFixture):
@@ -146,6 +154,15 @@ class TestSetup(CliFixture):
         self.assertTrue(self.skill_link.is_symlink())
         self.assertEqual(self.skill_link.resolve(), intercom.SKILL_SRC.resolve())
         self.assertTrue((self.skill_link / "SKILL.md").exists())
+
+        # the delegating subagent is linked per orchestrator, each to its own format
+        self.assertTrue(self.claude_agent_link.is_symlink())
+        self.assertEqual(self.claude_agent_link.resolve(), intercom.AGENT_SRC["claude_code"].resolve())
+        self.assertIn("mcp__intercom__delegate_to_antigravity", self.claude_agent_link.read_text())
+        self.assertTrue(self.opencode_agent_link.is_symlink())
+        self.assertEqual(self.opencode_agent_link.resolve(), intercom.AGENT_SRC["opencode"].resolve())
+        self.assertIn("mode: subagent", self.opencode_agent_link.read_text())
+        self.assertEqual(set(cfg["agent_links"]), {str(self.claude_agent_link), str(self.opencode_agent_link)})
 
     def test_yes_uses_detected_defaults(self) -> None:
         result = self.run_cli("setup", "--yes")
@@ -219,6 +236,8 @@ class TestSetup(CliFixture):
         self.assertTrue(link.is_symlink())
         self.assertFalse(self.skill_link.exists())
         self.assertFalse(self.mcp_log.exists())
+        self.assertTrue(self.opencode_agent_link.is_symlink())  # opencode gets its subagent
+        self.assertFalse(self.claude_agent_link.exists())  # claude_code not selected
 
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX environment")
@@ -235,6 +254,7 @@ class TestDoctorAndUninstall(CliFixture):
         self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
         self.assertIn("all checks passed", after.stdout)
         self.assertIn("[ok] Claude Code: `intercom` registered", after.stdout)
+        self.assertIn("[ok] delegating subagent linked", after.stdout)
         self.assertIn("[ok] Antigravity CLI (agy): READY", after.stdout)
 
     def test_uninstall_reverses_setup(self) -> None:
@@ -249,6 +269,8 @@ class TestDoctorAndUninstall(CliFixture):
         self.assertIn("mcp remove -s user intercom", self.mcp_log.read_text())
         self.assertFalse(self.mcp_marker.exists())
         self.assertFalse(self.skill_link.exists())
+        self.assertFalse(self.claude_agent_link.exists())
+        self.assertFalse(self.opencode_agent_link.exists())
         self.assertFalse(self.launcher.exists())
         self.assertFalse(self.config_json.exists())
         self.assertTrue(HERE.exists())  # no --purge: the checkout stays

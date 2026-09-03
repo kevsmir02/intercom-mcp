@@ -13,7 +13,8 @@ reviewable report back. Two harnesses are wired in:
 
 Each harness runs in its JSON print mode, so every report carries the harness's conversation ID.
 Passing it back as `conversation_id` resumes that session with its full context: a review-fix round
-costs one short prompt. A bundled skill teaches the orchestrator the delegate -> review -> fix loop.
+costs one short prompt. A bundled skill teaches the orchestrator the delegate -> review -> fix loop, and a bundled
+delegating subagent runs that loop in its own context so the main thread stays clean.
 
 ## Install
 
@@ -149,6 +150,23 @@ survives for the whole delegation, and `timeout_seconds` stays the real bound.
 
 Set `BRIDGE_HEARTBEAT_SECONDS=0` to disable the heartbeat.
 
+## Delegating subagent (keep the main context clean)
+
+`intercom setup` also installs an **`intercom-delegate`** subagent into each orchestrator you pick
+(`~/.claude/agents/` for Claude Code, `~/.config/opencode/agent/` for OpenCode). It runs in its own
+context window: the main orchestrator hands it a task, it calls the intercom tools, holds the verbose
+report and full diff in its own context, and returns only a short summary. The big report never
+enters the main thread.
+
+Use it by asking the main agent to delegate, for example:
+
+> Fix the failing payments test and delegate it to Antigravity.
+
+The main agent spawns `intercom-delegate`, which delegates through intercom, reviews the diff, runs a
+fix round with the conversation id if needed, and reports back: outcome, files changed, and test
+result. The subagent cannot edit files itself, so it must delegate the implementation. The delegation
+depth guard is unaffected, since the subagent is on the orchestrator side, not a delegated harness.
+
 ## Tool results
 
 Every `delegate_to_<harness>` result starts with one of:
@@ -171,6 +189,7 @@ Each report also carries `Conversation ID` and `Harness stats` (status, turns, t
 | `intercom.py` | The `intercom` command (setup wizard, doctor, serve, update, uninstall) |
 | `server.py` | The MCP server (harness adapters, subprocess runner, report formatting) |
 | `skills/intercom/SKILL.md` | Skill teaching the orchestrator the delegate -> review -> fix loop |
+| `agents/claude/`, `agents/opencode/` | The `intercom-delegate` subagent, one per orchestrator format |
 | `test_bridge.py`, `test_cli.py` | Hermetic tests with fake `agy` and `claude` binaries |
 | `opencode.json` | Template for a manual OpenCode registration |
 | `requirements.txt` | Runtime dependency (`mcp`, works with 1.x and 2.x) |
