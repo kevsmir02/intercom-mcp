@@ -221,6 +221,32 @@ class TestDoctorAndUninstall(CliFixture):
         self.assertIn('"harnesses": []', result.stdout)
 
 
+class TestSelectors(unittest.TestCase):
+    def test_multi_select_falls_back_to_numbered_prompt_without_a_tty(self) -> None:
+        import builtins
+
+        options = [("a", "Alpha", True), ("b", "Beta", False)]
+        answers = iter(["2"])  # pick option 2 -> key "b"
+        saved_raw, saved_input = intercom._RAW_TTY, builtins.input
+        intercom._RAW_TTY = False  # force the numbered path regardless of the test tty
+        builtins.input = lambda prompt="": next(answers)
+        try:
+            self.assertEqual(intercom.multi_select("pick", options), ["b"])
+        finally:
+            intercom._RAW_TTY, builtins.input = saved_raw, saved_input
+
+    def test_numbered_prompt_default_is_the_preselected_options(self) -> None:
+        import builtins
+
+        options = [("a", "Alpha", True), ("b", "Beta", False), ("c", "Gamma", True)]
+        saved_input = builtins.input
+        builtins.input = lambda prompt="": ""  # accept defaults
+        try:
+            self.assertEqual(intercom.ask_multi("pick", options), ["a", "c"])
+        finally:
+            builtins.input = saved_input
+
+
 class TestServeEnv(unittest.TestCase):
     def test_build_serve_env_fills_only_unset_values(self) -> None:
         cfg = {"harnesses": ["claude_code"], "default_flags": {"claude_code": "--model sonnet", "antigravity": ""}, "max_depth": 3}

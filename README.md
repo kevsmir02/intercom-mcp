@@ -28,10 +28,12 @@ What it does:
 2. Clones the repository into `~/.local/share/intercom` (or updates it when already present).
 3. Creates a virtual environment there and installs the `mcp` dependency.
 4. Writes the `intercom` launcher to `~/.local/bin`.
-5. Runs `intercom setup`, which detects `agy` and `claude`, probes their health, asks which of them
-   to expose and which orchestrators to register with, writes the OpenCode config entry, runs
-   `claude mcp add` for Claude Code, links the skill where both orchestrators find it, and saves
-   its choices to `~/.config/intercom/config.json`.
+5. Runs `intercom setup`, which detects `agy` and `claude`, probes their health, then presents
+   arrow-key checkboxes (space to toggle, enter to confirm) for which harnesses to expose and which
+   orchestrators to register with. It writes the OpenCode config entry, runs `claude mcp add` for
+   Claude Code, links the skill where both orchestrators find it, and saves its choices to
+   `~/.config/intercom/config.json`. On a terminal that cannot do raw input it falls back to a
+   numbered prompt.
 
 Restart the orchestrator afterwards and ask it to run `check_claude_code_health` or
 `check_antigravity_health`; a report starting with `[HEALTH: READY]` confirms the installation.

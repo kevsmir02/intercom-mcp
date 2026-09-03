@@ -24,6 +24,15 @@ import shutil
 import stat
 import subprocess
 import sys
+
+try:  # raw-terminal checkbox input; POSIX only
+    import select as _select
+    import termios as _termios
+    import tty as _tty
+
+    _RAW_TTY = True
+except ImportError:  # pragma: no cover - Windows
+    _RAW_TTY = False
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +190,83 @@ def ask_multi(title: str, options: list[tuple[str, str, bool]]) -> list[str]:
         except (ValueError, IndexError):
             pass
         print("  please enter numbers from the list, e.g. 1,2")
+
+
+def _read_key(fd: int) -> str:
+    """Read one keypress from a cbreak-mode terminal, normalised to a token."""
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":  # escape: an arrow sequence, or a bare Esc (cancel)
+        ready, _, _ = _select.select([fd], [], [], 0.05)
+        if not ready:
+            return "CANCEL"
+        seq = os.read(fd, 2)
+        return {b"[A": "UP", b"OA": "UP", b"[B": "DOWN", b"OB": "DOWN"}.get(seq, seq[-1:].decode("latin-1"))
+    return {
+        b"\r": "ENTER", b"\n": "ENTER", b" ": "SPACE", b"\x03": "CANCEL",
+        b"q": "CANCEL", b"Q": "CANCEL", b"k": "UP", b"j": "DOWN", b"a": "ALL", b"A": "ALL",
+    }.get(ch, ch.decode("latin-1", "replace"))
+
+
+def checkbox_select(title: str, options: list[tuple[str, str, bool]]) -> list[str]:
+    """Interactive checkbox list. Up/down move, space toggles, a = all/none, enter confirms,
+    q/Esc cancels (raises KeyboardInterrupt). Returns the selected keys, order preserved."""
+    keys = [key for key, _, _ in options]
+    labels = [label for _, label, _ in options]
+    selected = [bool(default) for _, _, default in options]
+    cursor = 0
+    hint = "  (up/down move . space toggle . a all/none . enter confirm . q cancel)"
+    fd = sys.stdin.fileno()
+    block = len(options) + 1  # option rows + hint row
+
+    def draw(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\x1b[{block}A")  # move cursor back to the top of the block
+        for i, label in enumerate(labels):
+            pointer = ">" if i == cursor else " "
+            box = "[x]" if selected[i] else "[ ]"
+            sys.stdout.write(f"\r\x1b[K  {pointer} {box} {label}\n")
+        sys.stdout.write(f"\r\x1b[K{hint}\n")
+        sys.stdout.flush()
+
+    print(title)
+    old = _termios.tcgetattr(fd)
+    try:
+        _tty.setcbreak(fd)
+        draw(first=True)
+        while True:
+            key = _read_key(fd)
+            if key == "UP":
+                cursor = (cursor - 1) % len(options)
+            elif key == "DOWN":
+                cursor = (cursor + 1) % len(options)
+            elif key == "SPACE":
+                selected[cursor] = not selected[cursor]
+            elif key == "ALL":
+                fill = not all(selected)
+                selected = [fill] * len(options)
+            elif key == "ENTER":
+                break
+            elif key == "CANCEL":
+                raise KeyboardInterrupt
+            else:
+                continue
+            draw()
+    finally:
+        _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
+    return [keys[i] for i, on in enumerate(selected) if on]
+
+
+def multi_select(title: str, options: list[tuple[str, str, bool]]) -> list[str]:
+    """Checkbox picker on a capable terminal; the numbered prompt otherwise."""
+    if _RAW_TTY and interactive() and sys.stdin.isatty():
+        try:
+            chosen = checkbox_select(title, options)
+        except (KeyboardInterrupt, OSError, _termios.error):
+            raise
+        labels = {key: label for key, label, _ in options}
+        print("  selected: " + (", ".join(labels[k] for k in chosen) if chosen else "none"))
+        return chosen
+    return ask_multi(title, options)
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +509,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     elif args.yes or not interactive():
         harnesses = detected
     else:
-        harnesses = ask_multi(
+        harnesses = multi_select(
             "Which harnesses should be available for delegation?",
             [(key, HARNESS_LABELS[key], bool(found[key])) for key in HARNESS_KEYS],
         )
@@ -453,7 +539,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         orchestrators = [key for key in ORCHESTRATOR_KEYS if present[key]]
     else:
         print()
-        orchestrators = ask_multi(
+        orchestrators = multi_select(
             "Which orchestrators should get the MCP server and the skill?",
             [(key, ORCHESTRATOR_LABELS[key], present[key]) for key in ORCHESTRATOR_KEYS],
         )
