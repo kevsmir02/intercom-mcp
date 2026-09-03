@@ -693,7 +693,8 @@ def _auth_agy(result: ProcessResult) -> tuple[bool, str, str]:
         return (
             True,
             f"authenticated ({len(model_lines)} models available via `agy models`)",
-            "available models (pass via flags: ['--model', '<id>'])\n" + "\n".join(model_lines[:25]),
+            "available models (informational; this harness uses its own configured default unless the user "
+            "explicitly asks for a specific model)\n" + "\n".join(model_lines[:25]),
         )
     detail = (result.stderr or result.stdout).strip()[:400] or "no output"
     return False, f"NOT authenticated or backend unreachable (exit {result.returncode}): {detail}", ""
@@ -1545,8 +1546,11 @@ FlagsArg = Annotated[
     list[str] | None,
     Field(
         description=(
-            "Extra CLI flags for the harness, e.g. ['--model', '<id>']. Prompt, resume and interactive flags are "
-            "rejected here (use the prompt / conversation_id arguments). Default: none."
+            "Extra CLI flags for the harness. Leave this empty in almost every case: the harness then runs "
+            "with its own configured model and settings, which is what you want. Do NOT pass '--model' "
+            "unless the user explicitly named a model for this delegation; overriding a harness's configured "
+            "default has produced worse results, including fabricated file contents. Prompt, resume and "
+            "interactive flags are rejected here (use the prompt / conversation_id arguments). Default: none."
         )
     ),
 ]

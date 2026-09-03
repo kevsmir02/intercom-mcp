@@ -60,6 +60,10 @@ verbose report and diff stay in the subagent's context. `intercom setup` install
 
 ## Guardrails
 
+- Leave `flags` empty. The harness runs on its own configured model, which is the tested path;
+  picking a different model has produced fabricated file contents. Pass `--model` only when the
+  user names one.
+
 - Keep secrets out of the brief: the harness inherits the environment and stores its
   transcript.
 - One task per delegation, one delegation at a time per working tree; parallel edits
