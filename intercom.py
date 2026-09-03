@@ -133,6 +133,7 @@ def default_config() -> dict[str, Any]:
         "skill_links": [],
         "agent_links": [],
         "claude_profiles": [],
+        "instruction_files": [],
     }
 
 
@@ -527,6 +528,74 @@ def claude_registered() -> bool:
 # ---------------------------------------------------------------------------
 
 
+INSTRUCTION_START = "<!-- INTERCOM_START -->"
+INSTRUCTION_END = "<!-- INTERCOM_END -->"
+
+# Kept deliberately short: these files are loaded into every turn of every session.
+INSTRUCTIONS_WITH_SUBAGENT = """## Delegating with intercom
+
+Hand implementation work to a harness through the `intercom-delegate` subagent rather than calling the
+`intercom` delegate tools from this thread: the subagent holds the harness's long report and returns a
+short summary, keeping your context clean. Leave the tool's `flags` empty unless the user names a
+model — the harness's own configured model is the tested path."""
+
+INSTRUCTIONS_NO_SUBAGENT = """## Delegating with intercom
+
+When delegating implementation work through the `intercom` tools, leave `flags` empty unless the user
+names a model — the harness's own configured model is the tested path. Give scoped briefs: name the
+files to read, the acceptance criteria, and the exact test command to run and quote."""
+
+
+def instruction_file(orchestrator: str) -> Path | None:
+    """The always-loaded instruction file each orchestrator reads."""
+    return {
+        "claude_code": home() / ".claude" / "CLAUDE.md",
+        "opencode": xdg_config_home() / "opencode" / "AGENTS.md",
+        "antigravity": home() / ".gemini" / "GEMINI.md",
+    }.get(orchestrator)
+
+
+def instruction_body(orchestrator: str) -> str:
+    # agy has no subagent mechanism, so it gets the model/brief rules only.
+    return INSTRUCTIONS_NO_SUBAGENT if orchestrator == "antigravity" else INSTRUCTIONS_WITH_SUBAGENT
+
+
+def write_instructions(path: Path, body: str) -> str:
+    """Insert or update our marked block, leaving the rest of the file untouched."""
+    marked = f"{INSTRUCTION_START}\n{body}\n{INSTRUCTION_END}"
+    existing = path.read_text() if path.exists() else ""
+    if INSTRUCTION_START in existing and INSTRUCTION_END in existing:
+        head, _, rest = existing.partition(INSTRUCTION_START)
+        _, _, tail = rest.partition(INSTRUCTION_END)
+        updated = head + marked + tail
+        if updated == existing:
+            return f"instructions already current in {path}"
+        verb = "updated"
+    else:
+        separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
+        updated = existing + separator + marked + "\n"
+        verb = "added"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(updated)
+    return f"{verb} intercom instructions in {path}"
+
+
+def remove_instructions(path: Path) -> str:
+    if not path.exists():
+        return f"no instruction file at {path}"
+    existing = path.read_text()
+    if INSTRUCTION_START not in existing or INSTRUCTION_END not in existing:
+        return f"no intercom instructions in {path}"
+    head, _, rest = existing.partition(INSTRUCTION_START)
+    _, _, tail = rest.partition(INSTRUCTION_END)
+    path.write_text((head.rstrip("\n") + "\n" + tail.lstrip("\n")).strip("\n") + "\n")
+    return f"removed intercom instructions from {path}"
+
+
+def has_instructions(path: Path) -> bool:
+    return path.exists() and INSTRUCTION_START in path.read_text()
+
+
 def skill_targets(orchestrators: list[str]) -> list[Path]:
     """Skill link dirs for the chosen orchestrators. ~/.claude/skills serves Claude Code and
     OpenCode; ~/.agents/skills serves the Antigravity CLI."""
@@ -740,6 +809,20 @@ def cmd_setup(args: argparse.Namespace) -> int:
             problems += 1
     cfg["claude_profiles"] = kept
 
+    instruction_files: list[str] = []
+    if not args.no_instructions:
+        for orchestrator in orchestrators:
+            path = instruction_file(orchestrator)
+            if path is None:
+                continue
+            say(write_instructions(path, instruction_body(orchestrator)))
+            instruction_files.append(str(path))
+        for profile in kept:
+            path = Path(os.path.expanduser(profile)) / "CLAUDE.md"
+            say(write_instructions(path, INSTRUCTIONS_WITH_SUBAGENT))
+            instruction_files.append(str(path))
+    cfg["instruction_files"] = instruction_files or cfg.get("instruction_files", [])
+
     say(f"configuration saved to {save_config(cfg)}")
 
     print()
@@ -815,6 +898,12 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         target = Path(link)
         report(target.is_symlink() and target.resolve() in known, f"delegating subagent linked at {target}")
 
+    instruction_files = cfg.get("instruction_files") or []
+    if instruction_files:
+        print("instructions")
+        for path in instruction_files:
+            report(has_instructions(Path(path)), f"delegation instructions present in {path}")
+
     print()
     print("all checks passed" if not problems else f"{problems} check(s) failed")
     return 1 if problems else 0
@@ -862,6 +951,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         say(unlink_skill(Path(link)))
     for link in cfg.get("agent_links") or [str(t) for t, _ in agent_targets(cfg.get("orchestrators", []))]:
         say(unlink_agent(Path(link)))
+    for path in cfg.get("instruction_files") or []:
+        say(remove_instructions(Path(path)))
     if launcher_path().exists():
         launcher_path().unlink()
         say(f"removed launcher {launcher_path()}")
@@ -899,6 +990,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--flags", action="append", metavar="HARNESS=FLAGS", help='default flags, e.g. --flags claude_code="--model sonnet"')
     setup.add_argument("--claude-config-dir", action="append", metavar="DIR",
                        help="also register for a Claude profile at this CLAUDE_CONFIG_DIR (repeatable)")
+    setup.add_argument("--no-instructions", action="store_true",
+                       help="do not add the intercom delegation guidance to CLAUDE.md/AGENTS.md/GEMINI.md")
     setup.add_argument("--max-depth", type=int, default=None, help="delegation depth allowed below the server (default 1)")
     setup.add_argument("--yes", "-y", action="store_true", help="accept detected defaults without prompting")
     setup.set_defaults(func=cmd_setup)

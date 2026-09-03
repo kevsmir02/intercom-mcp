@@ -156,6 +156,27 @@ survives for the whole delegation, and `timeout_seconds` stays the real bound.
 
 Set `BRIDGE_HEARTBEAT_SECONDS=0` to disable the heartbeat.
 
+## Standing delegation guidance
+
+Installing the subagent makes it available, not mandatory: a main agent with the intercom tools can
+still call them directly and pull the whole report into its own context. To make the subagent the
+default, `intercom setup` writes a short marked block into each orchestrator's always-loaded
+instruction file:
+
+| Orchestrator | File |
+| --- | --- |
+| Claude Code | `~/.claude/CLAUDE.md` (and `<profile>/CLAUDE.md` for extra profiles) |
+| OpenCode | `~/.config/opencode/AGENTS.md` |
+| Antigravity CLI | `~/.gemini/GEMINI.md` |
+
+The block sits between `<!-- INTERCOM_START -->` and `<!-- INTERCOM_END -->`, so re-running setup
+updates it in place rather than duplicating, `intercom uninstall` strips it, and everything else in
+the file is untouched. It says two things: route delegations through the `intercom-delegate` subagent,
+and leave `flags` empty unless the user names a model. The Antigravity variant omits the subagent
+sentence, since agy has no subagent mechanism.
+
+Skip it with `intercom setup --no-instructions` if you would rather write your own guidance.
+
 ## Delegating subagent (keep the main context clean)
 
 `intercom setup` also installs an **`intercom-delegate`** subagent into each orchestrator you pick

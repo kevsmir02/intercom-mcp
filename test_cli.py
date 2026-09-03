@@ -264,6 +264,52 @@ class TestSetup(CliFixture):
         self.assertFalse((profile / "skills" / "intercom").exists())
         self.assertFalse((profile / "agents" / "intercom-delegate.md").exists())
 
+    def test_instructions_are_written_updated_and_removed_idempotently(self) -> None:
+        claude_md = self.home / ".claude" / "CLAUDE.md"
+        claude_md.parent.mkdir(parents=True)
+        claude_md.write_text("# My rules\n\nKeep my existing guidance.\n")
+        agents_md = self.home / ".config" / "opencode" / "AGENTS.md"
+        agents_md.parent.mkdir(parents=True)
+        agents_md.write_text("# OpenCode rules\n")
+
+        result = self.run_cli("setup", "--harness", "claude_code",
+                              "--orchestrator", "claude_code", "--orchestrator", "opencode", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        body = claude_md.read_text()
+        self.assertIn("Keep my existing guidance.", body)  # the user's content survives
+        self.assertIn(intercom.INSTRUCTION_START, body)
+        self.assertIn("intercom-delegate` subagent", body)
+        self.assertIn("Delegating with intercom", agents_md.read_text())
+        cfg = json.loads(self.config_json.read_text())
+        self.assertIn(str(claude_md), cfg["instruction_files"])
+
+        # re-running does not duplicate the block
+        self.run_cli("setup", "--yes")
+        self.assertEqual(claude_md.read_text().count(intercom.INSTRUCTION_START), 1)
+
+        # uninstall strips the block and leaves the user's content
+        self.run_cli("uninstall", "--yes")
+        after = claude_md.read_text()
+        self.assertNotIn(intercom.INSTRUCTION_START, after)
+        self.assertIn("Keep my existing guidance.", after)
+
+    def test_no_instructions_flag_leaves_files_alone(self) -> None:
+        claude_md = self.home / ".claude" / "CLAUDE.md"
+        claude_md.parent.mkdir(parents=True)
+        claude_md.write_text("# Mine only\n")
+        result = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code",
+                              "--no-instructions", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(claude_md.read_text(), "# Mine only\n")
+
+    def test_antigravity_gets_the_no_subagent_instruction_variant(self) -> None:
+        gemini_md = self.home / ".gemini" / "GEMINI.md"
+        result = self.run_cli("setup", "--harness", "antigravity", "--orchestrator", "antigravity", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        body = gemini_md.read_text()
+        self.assertIn("Delegating with intercom", body)
+        self.assertNotIn("intercom-delegate` subagent", body)  # agy has no subagent
+
     def test_non_interactive_setup_without_flags_fails_clearly(self) -> None:
         result = self.run_cli("setup")
         self.assertNotEqual(result.returncode, 0)
