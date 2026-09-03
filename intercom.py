@@ -50,7 +50,7 @@ HARNESS_LABELS = {
 HARNESS_ENV_PREFIX = {"antigravity": "AGY", "claude_code": "CLAUDE", "opencode": "OPENCODE", "pi": "PI"}
 ORCHESTRATOR_KEYS = ("opencode", "claude_code")
 ORCHESTRATOR_LABELS = {"opencode": "OpenCode", "claude_code": "Claude Code"}
-OPENCODE_TIMEOUT_MS = 3_600_000
+OPENCODE_TIMEOUT_MS = 10_800_000
 CONFIG_VERSION = 1
 
 
@@ -382,10 +382,17 @@ def register_opencode(path: Path | None = None) -> str:
     mcp = data.setdefault("mcp", {})
     if not isinstance(mcp, dict):
         raise SystemExit(f"error: the `mcp` key in {path} is not an object")
-    mcp[SERVER_KEY] = opencode_entry()
+    # Merge onto any existing entry so a hand-added `environment` or other keys survive;
+    # only type/command/enabled/timeout are updated.
+    current = mcp.get(SERVER_KEY)
+    entry = dict(current) if isinstance(current, dict) else {}
+    entry.update(opencode_entry())
+    existed = isinstance(current, dict)
+    mcp[SERVER_KEY] = entry
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n")
-    return f"registered `{SERVER_KEY}` in {path}"
+    verb = "updated" if existed else "registered"
+    return f"{verb} `{SERVER_KEY}` in {path} (other settings left untouched)"
 
 
 def unregister_opencode(path: Path | None = None) -> str:
@@ -502,6 +509,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"  {HARNESS_LABELS[key]:<28} not found on PATH")
     print()
 
+    existing = load_config()
+    has_config = config_path().exists()
+    if has_config:
+        say(f"existing configuration found at {config_path()}; your current selections are preserved as defaults")
+
     scripted = bool(args.harness or args.orchestrator or args.yes)
     if not interactive() and not scripted:
         raise SystemExit(
@@ -509,14 +521,16 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "(accept detected defaults) and/or explicit --harness / --orchestrator flags."
         )
 
+    saved_harnesses = [h for h in existing.get("harnesses", []) if h in HARNESS_KEYS]
+    default_harnesses = saved_harnesses or detected  # first run: detected; re-run: keep your selection
     if args.harness:
         harnesses = list(dict.fromkeys(args.harness))
     elif args.yes or not interactive():
-        harnesses = detected
+        harnesses = default_harnesses
     else:
         harnesses = multi_select(
             "Which harnesses should be available for delegation?",
-            [(key, HARNESS_LABELS[key], bool(found[key])) for key in HARNESS_KEYS],
+            [(key, HARNESS_LABELS[key], key in default_harnesses) for key in HARNESS_KEYS],
         )
     if not harnesses:
         raise SystemExit("error: no harness selected; install agy and/or claude, then rerun `intercom setup`")
@@ -525,7 +539,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
             warn(f"{HARNESS_LABELS[key]} is enabled but its binary is not on PATH; set {HARNESS_ENV_PREFIX[key]}_BIN or install it")
 
     flags = _parse_flag_overrides(args.flags)
-    existing = load_config()
     if not flags and interactive() and not args.yes:
         print()
         for key in harnesses:
@@ -538,15 +551,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
             flags.setdefault(key, (existing.get("default_flags") or {}).get(key, ""))
 
     present = detect_orchestrators()
+    saved_orch = [o for o in existing.get("orchestrators", []) if o in ORCHESTRATOR_KEYS]
+    default_orch = saved_orch or [key for key in ORCHESTRATOR_KEYS if present[key]]
     if args.orchestrator:
         orchestrators = list(dict.fromkeys(args.orchestrator))
     elif args.yes or not interactive():
-        orchestrators = [key for key in ORCHESTRATOR_KEYS if present[key]]
+        orchestrators = default_orch
     else:
         print()
         orchestrators = multi_select(
             "Which orchestrators should get the MCP server and the skill?",
-            [(key, ORCHESTRATOR_LABELS[key], present[key]) for key in ORCHESTRATOR_KEYS],
+            [(key, ORCHESTRATOR_LABELS[key], key in default_orch) for key in ORCHESTRATOR_KEYS],
         )
 
     cfg = existing

@@ -23,7 +23,7 @@
         "BRIDGE_HEARTBEAT_SECONDS": "15",
         "BRIDGE_LOG_LEVEL": "INFO"
       },
-      "timeout": 3600000
+      "timeout": 10800000
     }
   }
 }

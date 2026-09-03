@@ -24,6 +24,15 @@ orchestrators to register:
 curl -fsSL https://raw.githubusercontent.com/kevsmir02/intercom-mcp/main/install.sh | bash
 ```
 
+### Or ask your agent to install it
+
+If you already run OpenCode or Claude Code, tell it:
+
+> Fetch and follow the instructions at https://raw.githubusercontent.com/kevsmir02/intercom-mcp/main/INSTALL.md
+
+The agent runs the installer, configures the harnesses it finds, registers the server, and
+verifies with `intercom doctor`. You then restart the orchestrator so it loads the new tools.
+
 What it does:
 
 1. Checks for `git` and Python 3.10+.
@@ -99,7 +108,7 @@ being cut off by the orchestrator, the server emits a progress notification ever
 `BRIDGE_HEARTBEAT_SECONDS` (default 15). OpenCode resets its tool-call timer on each one, so the call
 survives for the whole delegation, and `timeout_seconds` stays the real bound.
 
-- **OpenCode**: the generated config sets `mcp.intercom.timeout` to one hour as a backstop; the
+- **OpenCode**: the generated config sets `mcp.intercom.timeout` to three hours as a backstop; the
   heartbeat handles anything longer.
 - **Claude Code**: it honours the heartbeat as well; if a delegation still gets cut off, raise
   `MCP_TOOL_TIMEOUT` (milliseconds) in its environment.

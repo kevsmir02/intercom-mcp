@@ -166,6 +166,41 @@ class TestSetup(CliFixture):
         self.assertEqual(log.count("mcp add"), 2)  # re-registered, after a remove each time
         self.assertGreaterEqual(log.count("mcp remove"), 2)
 
+    def test_rerun_preserves_existing_selection(self) -> None:
+        first = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code", "--yes")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(json.loads(self.config_json.read_text())["harnesses"], ["claude_code"])
+        # A plain --yes re-run must NOT expand to all detected harnesses; it keeps the saved choice.
+        second = self.run_cli("setup", "--yes")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("preserved as defaults", second.stdout)
+        cfg = json.loads(self.config_json.read_text())
+        self.assertEqual(cfg["harnesses"], ["claude_code"])
+        self.assertEqual(cfg["orchestrators"], ["claude_code"])
+
+    def test_rerun_preserves_default_flags(self) -> None:
+        self.run_cli("setup", "--harness", "antigravity", "--orchestrator", "claude_code",
+                     "--flags", "antigravity=--model fake-model-high", "--yes")
+        self.run_cli("setup", "--yes")
+        cfg = json.loads(self.config_json.read_text())
+        self.assertEqual(cfg["default_flags"].get("antigravity"), "--model fake-model-high")
+
+    def test_opencode_entry_merge_keeps_custom_environment(self) -> None:
+        self.opencode_json.parent.mkdir(parents=True)
+        self.opencode_json.write_text(json.dumps({
+            "theme": "keep-me",
+            "mcp": {"intercom": {"type": "local", "command": ["/old/intercom", "serve"],
+                                 "environment": {"CUSTOM": "x"}, "enabled": False}},
+        }))
+        result = self.run_cli("setup", "--harness", "antigravity", "--orchestrator", "opencode", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        oc = json.loads(self.opencode_json.read_text())
+        entry = oc["mcp"]["intercom"]
+        self.assertEqual(entry["environment"], {"CUSTOM": "x"})  # user env preserved
+        self.assertEqual(entry["command"], [str(self.launcher), "serve"])  # command updated
+        self.assertEqual(entry["timeout"], intercom.OPENCODE_TIMEOUT_MS)
+        self.assertEqual(oc["theme"], "keep-me")
+
     def test_non_interactive_setup_without_flags_fails_clearly(self) -> None:
         result = self.run_cli("setup")
         self.assertNotEqual(result.returncode, 0)
