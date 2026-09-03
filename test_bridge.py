@@ -65,8 +65,25 @@ if is_agy and args[:1] == ["models"]:
     if os.environ.get("FAKE_AUTH_FAIL"):
         sys.stderr.write("Error: not authenticated. Run 'agy' interactively to log in.\n"); sys.exit(1)
     out("Fetching available models...\nfake-model-high\tFake Model (High)\nfake-model-low\tFake Model (Low)\n"); sys.exit(0)
+if is_agy and args[:1] == ["mcp"]:
+    log = os.environ.get("FAKE_AGY_MCP_LOG"); marker = os.environ.get("FAKE_AGY_MCP_MARKER")
+    if log:
+        open(log, "a").write(" ".join(args) + chr(10))
+    sub = args[1] if len(args) > 1 else ""
+    if sub == "add" and marker:
+        open(marker, "w").write("registered" + chr(10))
+    elif sub == "remove":
+        if marker and os.path.exists(marker):
+            os.remove(marker)
+        else:
+            sys.exit(1)
+    elif sub == "list":
+        out("intercom  stdio  enabled" + chr(10) if (marker and os.path.exists(marker)) else "codegraph  stdio  enabled" + chr(10))
+    sys.exit(0)
 if is_claude and args[:1] == ["mcp"]:
-    log, marker = os.environ.get("FAKE_MCP_LOG"), os.environ.get("FAKE_MCP_MARKER")
+    log = os.environ.get("FAKE_MCP_LOG")
+    ccd = os.environ.get("CLAUDE_CONFIG_DIR")
+    marker = os.path.join(ccd, ".mcp-intercom") if ccd else os.environ.get("FAKE_MCP_MARKER")
     if log:
         with open(log, "a") as fh:
             fh.write(" ".join(args) + "\n")
@@ -226,7 +243,7 @@ def input_schema(tool) -> dict:
 
 
 CONFIG_KEYS = {"AGY_BIN", "AGY_AUTO_APPROVE_FLAGS", "AGY_DEFAULT_FLAGS", "CLAUDE_BIN", "CLAUDE_AUTO_APPROVE_FLAGS",
-               "CLAUDE_DEFAULT_FLAGS", "CLAUDECODE", "OPENCODE_BIN", "PI_BIN"}
+               "CLAUDE_DEFAULT_FLAGS", "CLAUDECODE", "OPENCODE_BIN", "PI_BIN", "CLAUDE_CONFIG_DIR"}
 
 
 class BridgeTestCase(unittest.IsolatedAsyncioTestCase):

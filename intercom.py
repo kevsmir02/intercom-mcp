@@ -53,8 +53,8 @@ HARNESS_LABELS = {
     "pi": "pi (pi-coding-agent)",
 }
 HARNESS_ENV_PREFIX = {"antigravity": "AGY", "claude_code": "CLAUDE", "opencode": "OPENCODE", "pi": "PI"}
-ORCHESTRATOR_KEYS = ("opencode", "claude_code")
-ORCHESTRATOR_LABELS = {"opencode": "OpenCode", "claude_code": "Claude Code"}
+ORCHESTRATOR_KEYS = ("opencode", "claude_code", "antigravity")
+ORCHESTRATOR_LABELS = {"opencode": "OpenCode", "claude_code": "Claude Code", "antigravity": "Antigravity CLI (agy)"}
 OPENCODE_TIMEOUT_MS = 10_800_000
 CONFIG_VERSION = 1
 
@@ -108,6 +108,15 @@ def opencode_agent_dir() -> Path:
     return xdg_config_home() / "opencode" / "agent"
 
 
+def agents_skills_dir() -> Path:
+    """Shared ~/.agents/skills, which the Antigravity CLI (and OpenCode) read."""
+    return home() / ".agents" / "skills"
+
+
+def agy_bin() -> str | None:
+    return shutil.which(os.path.expanduser(os.environ.get("AGY_BIN", "").strip() or "agy"))
+
+
 def venv_python() -> str:
     candidate = HERE / ".venv" / "bin" / "python"
     return str(candidate) if candidate.exists() else sys.executable
@@ -123,6 +132,7 @@ def default_config() -> dict[str, Any]:
         "max_depth": 1,
         "skill_links": [],
         "agent_links": [],
+        "claude_profiles": [],
     }
 
 
@@ -335,6 +345,7 @@ def detect_orchestrators() -> dict[str, bool]:
     return {
         "opencode": bool(shutil.which("opencode")) or opencode_config_path().parent.is_dir(),
         "claude_code": claude_bin() is not None,
+        "antigravity": agy_bin() is not None,
     }
 
 
@@ -425,11 +436,69 @@ def unregister_opencode(path: Path | None = None) -> str:
     return f"removed `{SERVER_KEY}` from {path}"
 
 
-def _claude(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+def _claude(*args: str, config_dir: str | None = None) -> subprocess.CompletedProcess[str]:
     binary = claude_bin()
     if not binary:
         raise SystemExit("error: `claude` is not on PATH (set CLAUDE_BIN to its absolute path)")
-    return subprocess.run([binary, *args], capture_output=True, text=True, check=check)
+    env = dict(os.environ)
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return subprocess.run([binary, *args], capture_output=True, text=True, env=env)
+
+
+def _agy(*args: str) -> subprocess.CompletedProcess[str]:
+    binary = agy_bin()
+    if not binary:
+        raise SystemExit("error: `agy` is not on PATH (set AGY_BIN to its absolute path)")
+    return subprocess.run([binary, *args], capture_output=True, text=True)
+
+
+def register_antigravity() -> str:
+    # `agy mcp add` is add-or-update, so it is idempotent.
+    result = _agy("mcp", "add", SERVER_KEY, str(launcher_path()), "serve")
+    if result.returncode != 0:
+        raise SystemExit(f"error: `agy mcp add` failed:\n{(result.stderr or result.stdout).strip()}")
+    return f"registered `{SERVER_KEY}` with the Antigravity CLI"
+
+
+def unregister_antigravity() -> str:
+    result = _agy("mcp", "remove", SERVER_KEY)
+    if result.returncode != 0:
+        return f"`{SERVER_KEY}` was not registered with the Antigravity CLI"
+    return f"removed `{SERVER_KEY}` from the Antigravity CLI"
+
+
+def antigravity_registered() -> bool:
+    if not agy_bin():
+        return False
+    result = _agy("mcp", "list")
+    return result.returncode == 0 and SERVER_KEY in result.stdout
+
+
+def register_claude_profile(config_dir: str) -> str:
+    """Register and link intercom for an additional Claude profile (CLAUDE_CONFIG_DIR)."""
+    _claude("mcp", "remove", "-s", "user", SERVER_KEY, config_dir=config_dir)
+    result = _claude("mcp", "add", "-s", "user", SERVER_KEY, "--", str(launcher_path()), "serve", config_dir=config_dir)
+    if result.returncode != 0:
+        raise SystemExit(f"error: `claude mcp add` for {config_dir} failed:\n{(result.stderr or result.stdout).strip()}")
+    base = Path(os.path.expanduser(config_dir))
+    link_skill(base / "skills" / SKILL_NAME)
+    link_agent(base / "agents" / f"{AGENT_NAME}.md", AGENT_SRC["claude_code"])
+    return f"registered `{SERVER_KEY}` for Claude profile {config_dir} (server, skill, subagent)"
+
+
+def unregister_claude_profile(config_dir: str) -> str:
+    _claude("mcp", "remove", "-s", "user", SERVER_KEY, config_dir=config_dir)
+    base = Path(os.path.expanduser(config_dir))
+    unlink_skill(base / "skills" / SKILL_NAME)
+    unlink_agent(base / "agents" / f"{AGENT_NAME}.md")
+    return f"removed `{SERVER_KEY}` from Claude profile {config_dir}"
+
+
+def claude_profile_registered(config_dir: str) -> bool:
+    if not claude_bin():
+        return False
+    return _claude("mcp", "get", SERVER_KEY, config_dir=config_dir).returncode == 0
 
 
 def register_claude() -> str:
@@ -459,10 +528,16 @@ def claude_registered() -> bool:
 
 
 def skill_targets(orchestrators: list[str]) -> list[Path]:
-    """Both orchestrators read ~/.claude/skills, so one link serves both when Claude Code is in play."""
+    """Skill link dirs for the chosen orchestrators. ~/.claude/skills serves Claude Code and
+    OpenCode; ~/.agents/skills serves the Antigravity CLI."""
+    targets: list[Path] = []
     if "claude_code" in orchestrators or not orchestrators:
-        return [claude_skills_dir() / SKILL_NAME]
-    return [opencode_skills_dir() / SKILL_NAME]
+        targets.append(claude_skills_dir() / SKILL_NAME)
+    elif "opencode" in orchestrators:
+        targets.append(opencode_skills_dir() / SKILL_NAME)
+    if "antigravity" in orchestrators:
+        targets.append(agents_skills_dir() / SKILL_NAME)
+    return targets
 
 
 def link_skill(target: Path) -> str:
@@ -631,6 +706,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         except SystemExit as exc:
             warn(str(exc))
             problems += 1
+    if "antigravity" in orchestrators:
+        try:
+            say(register_antigravity())
+        except SystemExit as exc:
+            warn(str(exc))
+            problems += 1
     links: list[str] = []
     for target in skill_targets(orchestrators):
         message = link_skill(target)
@@ -645,6 +726,20 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if message.startswith(("linked", "delegating subagent already")):
             agent_links.append(str(target))
     cfg["agent_links"] = agent_links
+
+    saved_profiles = [d for d in existing.get("claude_profiles", []) if isinstance(d, str)]
+    new_profiles = [os.path.abspath(os.path.expanduser(d)) for d in (args.claude_config_dir or [])]
+    profiles = list(dict.fromkeys(saved_profiles + new_profiles))
+    kept: list[str] = []
+    for profile in profiles:
+        try:
+            say(register_claude_profile(profile))
+            kept.append(profile)
+        except SystemExit as exc:
+            warn(str(exc))
+            problems += 1
+    cfg["claude_profiles"] = kept
+
     say(f"configuration saved to {save_config(cfg)}")
 
     print()
@@ -696,7 +791,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         report(registered, f"OpenCode: `{SERVER_KEY}` registered in {path}")
     if "claude_code" in orchestrators:
         report(claude_registered(), f"Claude Code: `{SERVER_KEY}` registered (claude mcp get {SERVER_KEY})")
-    if not orchestrators:
+    if "antigravity" in orchestrators:
+        report(antigravity_registered(), f"Antigravity CLI: `{SERVER_KEY}` registered (agy mcp list)")
+    for profile in cfg.get("claude_profiles", []):
+        report(claude_profile_registered(profile), f"Claude profile {profile}: `{SERVER_KEY}` registered")
+    if not orchestrators and not cfg.get("claude_profiles"):
         report(False, "no orchestrator registered; run `intercom setup`")
 
     print("skill")
@@ -755,6 +854,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         say(unregister_opencode())
     if claude_bin():
         say(unregister_claude())
+    if agy_bin():
+        say(unregister_antigravity())
+    for profile in cfg.get("claude_profiles", []):
+        say(unregister_claude_profile(profile))
     for link in cfg.get("skill_links") or [str(t) for t in skill_targets(cfg.get("orchestrators", []))]:
         say(unlink_skill(Path(link)))
     for link in cfg.get("agent_links") or [str(t) for t, _ in agent_targets(cfg.get("orchestrators", []))]:
@@ -794,6 +897,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--harness", action="append", choices=HARNESS_KEYS, help="enable a harness (repeatable)")
     setup.add_argument("--orchestrator", action="append", choices=ORCHESTRATOR_KEYS, help="register with an orchestrator (repeatable)")
     setup.add_argument("--flags", action="append", metavar="HARNESS=FLAGS", help='default flags, e.g. --flags claude_code="--model sonnet"')
+    setup.add_argument("--claude-config-dir", action="append", metavar="DIR",
+                       help="also register for a Claude profile at this CLAUDE_CONFIG_DIR (repeatable)")
     setup.add_argument("--max-depth", type=int, default=None, help="delegation depth allowed below the server (default 1)")
     setup.add_argument("--yes", "-y", action="store_true", help="accept detected defaults without prompting")
     setup.set_defaults(func=cmd_setup)

@@ -73,6 +73,7 @@ If `~/.local/bin` is not on your `PATH`, the installer says so; add
 | --- | --- |
 | `intercom setup` | The wizard above. Safe to re-run: it preserves your current selection and lets you toggle harnesses, flags or orchestrators. |
 | `intercom setup --harness claude_code --orchestrator opencode --flags claude_code="--model sonnet" --yes` | Scripted setup for dotfiles and CI |
+| `intercom setup --orchestrator antigravity --claude-config-dir ~/.claude-b` | Also register the Antigravity CLI and an extra Claude profile |
 | `intercom doctor` | Health of the enabled harnesses plus registration, skill and subagent checks; exits non-zero on any failure |
 | `intercom serve` | Runs the MCP server on stdio. This is what the registrations invoke |
 | `intercom test` | Runs the hermetic test suite (fake harnesses, no quota consumed) |
@@ -103,20 +104,24 @@ intercom setup      # your current choices come pre-selected; tick any new harne
 
 Re-running `curl ... | bash` or the agent-followed `INSTALL.md` updates in place the same way.
 
-## Registering with another Claude Code profile
+## Orchestrators
 
-`intercom setup` registers the default Claude Code profile (`~/.claude`). To register a second profile
-that uses `CLAUDE_CONFIG_DIR`, point the same launcher at it and link the skill into that profile:
+Three orchestrators can host the intercom server, and `intercom setup` registers whichever you pick:
+
+- **OpenCode** — entry merged into `~/.config/opencode/opencode.json`.
+- **Claude Code** — `claude mcp add` at user scope; also gets the `intercom-delegate` subagent.
+- **Antigravity CLI (`agy`)** — `agy mcp add`; gets the skill in `~/.agents/skills` (agy reads it), but
+  not the subagent, which is a Claude/OpenCode construct.
+
+### Additional Claude Code profiles
+
+To also register a second Claude profile that uses `CLAUDE_CONFIG_DIR` (for example `~/.claude-b`),
+pass it to setup; it is registered, skill- and subagent-linked, tracked in the config, and removed by
+`intercom uninstall`:
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.claude-b claude mcp add -s user intercom -- ~/.local/bin/intercom serve
-mkdir -p ~/.claude-b/skills
-ln -sn ~/.local/share/intercom/skills/intercom ~/.claude-b/skills/intercom
+intercom setup --claude-config-dir ~/.claude-b
 ```
-
-Both profiles share `~/.config/intercom/config.json`, so they expose the same harnesses. `intercom
-uninstall` only removes the default profile; remove a second profile with
-`CLAUDE_CONFIG_DIR=~/.claude-b claude mcp remove -s user intercom` and by deleting its skill link.
 
 ## Manual installation
 

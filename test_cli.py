@@ -43,6 +43,8 @@ class CliFixture(unittest.TestCase):
         self.bin_dir = self.tmp / "bin"
         self.mcp_log = self.tmp / "mcp.log"
         self.mcp_marker = self.tmp / "mcp.marker"
+        self.agy_mcp_log = self.tmp / "agy-mcp.log"
+        self.agy_mcp_marker = self.tmp / "agy-mcp.marker"
 
     def _install_fake(self, name: str) -> Path:
         path = self.fake_dir / name
@@ -70,6 +72,8 @@ class CliFixture(unittest.TestCase):
                 "PI_BIN": str(self.fake_pi),
                 "FAKE_MCP_LOG": str(self.mcp_log),
                 "FAKE_MCP_MARKER": str(self.mcp_marker),
+                "FAKE_AGY_MCP_LOG": str(self.agy_mcp_log),
+                "FAKE_AGY_MCP_MARKER": str(self.agy_mcp_marker),
                 "BRIDGE_KILL_GRACE_SECONDS": "1",
             }
         )
@@ -113,6 +117,10 @@ class CliFixture(unittest.TestCase):
     @property
     def opencode_agent_link(self) -> Path:
         return self.home / ".config" / "opencode" / "agent" / "intercom-delegate.md"
+
+    @property
+    def agents_skill_link(self) -> Path:
+        return self.home / ".agents" / "skills" / "intercom"
 
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX environment")
@@ -169,7 +177,9 @@ class TestSetup(CliFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         cfg = json.loads(self.config_json.read_text())
         self.assertEqual(cfg["harnesses"], ["antigravity", "claude_code", "opencode", "pi"])  # all fakes resolve
-        self.assertEqual(cfg["orchestrators"], ["claude_code"])  # opencode scrubbed from PATH, no config dir
+        self.assertEqual(cfg["orchestrators"], ["claude_code", "antigravity"])  # opencode scrubbed; agy detected
+        self.assertTrue(self.agy_mcp_marker.exists())  # agy registration happened
+        self.assertIn("mcp add intercom", self.agy_mcp_log.read_text())
         self.assertFalse(self.opencode_json.exists())
         self.assertIn("mcp add", self.mcp_log.read_text())
         self.assertTrue(self.skill_link.is_symlink())
@@ -217,6 +227,42 @@ class TestSetup(CliFixture):
         self.assertEqual(entry["command"], [str(self.launcher), "serve"])  # command updated
         self.assertEqual(entry["timeout"], intercom.OPENCODE_TIMEOUT_MS)
         self.assertEqual(oc["theme"], "keep-me")
+
+    def test_antigravity_orchestrator_registers_via_agy_and_links_agents_skill(self) -> None:
+        result = self.run_cli("setup", "--harness", "antigravity", "--orchestrator", "antigravity", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # registered through `agy mcp add`, not opencode.json or `claude mcp`
+        self.assertTrue(self.agy_mcp_marker.exists())
+        self.assertIn("mcp add intercom", self.agy_mcp_log.read_text())
+        self.assertFalse(self.opencode_json.exists())
+        # skill linked into ~/.agents/skills (agy reads it); no subagent for agy
+        self.assertTrue(self.agents_skill_link.is_symlink())
+        self.assertEqual(self.agents_skill_link.resolve(), intercom.SKILL_SRC.resolve())
+        self.assertFalse(self.claude_agent_link.exists())
+        self.assertFalse(self.opencode_agent_link.exists())
+        cfg = json.loads(self.config_json.read_text())
+        self.assertEqual(cfg["orchestrators"], ["antigravity"])
+
+    def test_extra_claude_profile_is_registered_tracked_and_removed(self) -> None:
+        profile = self.tmp / "claude-b"
+        profile.mkdir()
+        setup = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code",
+                             "--claude-config-dir", str(profile), "--yes")
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        cfg = json.loads(self.config_json.read_text())
+        self.assertEqual(cfg["claude_profiles"], [str(profile)])
+        # the profile got its own registration marker, skill and subagent links
+        self.assertTrue((profile / ".mcp-intercom").exists())
+        self.assertTrue((profile / "skills" / "intercom").is_symlink())
+        self.assertTrue((profile / "agents" / "intercom-delegate.md").is_symlink())
+        # re-run without the flag preserves the profile
+        self.run_cli("setup", "--yes")
+        self.assertEqual(json.loads(self.config_json.read_text())["claude_profiles"], [str(profile)])
+        # uninstall removes the profile registration and links
+        self.run_cli("uninstall", "--yes")
+        self.assertFalse((profile / ".mcp-intercom").exists())
+        self.assertFalse((profile / "skills" / "intercom").exists())
+        self.assertFalse((profile / "agents" / "intercom-delegate.md").exists())
 
     def test_non_interactive_setup_without_flags_fails_clearly(self) -> None:
         result = self.run_cli("setup")
