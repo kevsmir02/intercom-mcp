@@ -40,10 +40,11 @@ What it does:
 2. Clones the repository into `~/.local/share/intercom` (or updates it when already present).
 3. Creates a virtual environment there and installs the `mcp` dependency.
 4. Writes the `intercom` launcher to `~/.local/bin`.
-5. Runs `intercom setup`, which detects `agy` and `claude`, probes their health, then presents
-   arrow-key checkboxes (space to toggle, enter to confirm) for which harnesses to expose and which
-   orchestrators to register with. It writes the OpenCode config entry, runs `claude mcp add` for
-   Claude Code, links the skill where both orchestrators find it, and saves its choices to
+5. Runs `intercom setup`, which detects the installed harness CLIs (`agy`, `claude`, `opencode`,
+   `pi`), probes their health, then presents arrow-key checkboxes (space to toggle, enter to confirm)
+   for which harnesses to expose and which orchestrators to register with. It writes the OpenCode
+   config entry, runs `claude mcp add` for Claude Code, links the skill and the `intercom-delegate`
+   subagent where each orchestrator finds them, and saves its choices to
    `~/.config/intercom/config.json`. On a terminal that cannot do raw input it falls back to a
    numbered prompt.
 
@@ -72,7 +73,7 @@ If `~/.local/bin` is not on your `PATH`, the installer says so; add
 | --- | --- |
 | `intercom setup` | The wizard above. Safe to re-run: it preserves your current selection and lets you toggle harnesses, flags or orchestrators. |
 | `intercom setup --harness claude_code --orchestrator opencode --flags claude_code="--model sonnet" --yes` | Scripted setup for dotfiles and CI |
-| `intercom doctor` | Health of the enabled harnesses plus registration and skill checks; exits non-zero on any failure |
+| `intercom doctor` | Health of the enabled harnesses plus registration, skill and subagent checks; exits non-zero on any failure |
 | `intercom serve` | Runs the MCP server on stdio. This is what the registrations invoke |
 | `intercom test` | Runs the hermetic test suite (fake harnesses, no quota consumed) |
 | `intercom update` | `git pull` plus dependency reinstall |
