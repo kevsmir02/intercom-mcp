@@ -45,7 +45,11 @@ which orchestrators to register with. It then writes the registrations, links th
 Restart the orchestrator afterwards and ask it to run `check_antigravity_health`; a report starting
 with `[HEALTH: READY]` confirms the installation.
 
-Prerequisites: `git`, Python 3.10+, and at least one harness logged in.
+Prerequisites: **Linux**, `git`, Python 3.10+, and at least one harness logged in.
+
+Linux is the only platform this is developed and tested on. The installer is bash, the setup wizard
+needs a POSIX terminal, and process-tree termination is built around `/proc` (with a `ps` fallback
+that should cover macOS but is not exercised there). Windows is not supported.
 
 ### Or ask your agent to install it
 

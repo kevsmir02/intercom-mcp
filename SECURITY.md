@@ -27,7 +27,7 @@ There is no sandbox. A delegation is as privileged as the user running the MCP s
 | --- | --- |
 | `BRIDGE_ALLOWED_DIRS=/path/one:/path/two` | Refuses any `working_dir` outside those roots. Set it with `intercom setup --allowed-dir /path/one`. |
 | `auto_approve: false` on a call | The harness asks for permission instead of proceeding; in headless mode it records denials rather than editing. |
-| `consult_<harness>` | Read-only mode (plan mode / no edit tools) with auto-approval off. Use it for reviews and second opinions instead of a delegation. |
+| `consult_<harness>` / `consult_many` | The harness's read-only mode (plan mode, or edit tools excluded) with auto-approval off. Use it for reviews and second opinions instead of a delegation. **It disables the harness's edit tools; it is not a sandbox** -- the harness can still run commands and reach the network, and observed behaviour includes writing plan files outside the working tree. The report carries a change summary either way, and warns if anything in the tree changed. |
 | `isolate: true` on a call | Runs in a throwaway `git worktree`, so the delegation cannot touch your working tree; you apply the resulting patch yourself. |
 | `BRIDGE_STRIP_ENV=NAME,NAME` | Hides named variables from the harness. |
 | `BRIDGE_MAX_DEPTH` | Stops a delegated harness from delegating further (default: one level). |
@@ -39,9 +39,10 @@ There is no sandbox. A delegation is as privileged as the user running the MCP s
   `CREDENTIAL`) are replaced with `[redacted:$NAME]`. This is a backstop against a harness echoing
   its environment, not a guarantee: a secret the harness paraphrases or re-encodes will get through.
 - **Process-tree termination.** On timeout or cancellation the harness and every descendant are
-  killed (SIGTERM, then SIGKILL). Descendants are found through `/proc` on Linux and through `ps`
-  elsewhere, so a grandchild that left the process group is still caught. Windows delegates the tree
-  kill to `taskkill /F /T`, which skips the graceful stage.
+  killed (SIGTERM, then SIGKILL). Descendants are found through `/proc`, with a `ps` fallback for
+  systems without it, so a grandchild that left the process group is still caught. This is tested on
+  Linux only, which is the supported platform; the Windows path (`taskkill /F /T`) skips the
+  graceful stage and is not exercised.
 - **A run journal** under `$XDG_STATE_HOME/intercom` (default `~/.local/state/intercom`) holding
   each run's full report, and the patch of isolated runs. Reports contain your code. Treat that
   directory as sensitive; `BRIDGE_KEEP_RUNS=0` keeps everything, and pruning is by count, not age.

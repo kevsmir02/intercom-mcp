@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -122,6 +123,14 @@ VALUE_OPTS = {"--output-format", "--print-timeout", "--model", "--conversation",
               "--thinking", "--agent", "--variant", "--title", "--dir"}
 prompt = None
 source = "stdin"
+out_format = "text"
+for _i, _a in enumerate(args):
+    if _a == "--output-format" and _i + 1 < len(args):
+        out_format = args[_i + 1]
+    elif _a == "--mode" and _i + 1 < len(args):
+        out_format = args[_i + 1]
+    elif _a == "--format" and _i + 1 < len(args):
+        out_format = args[_i + 1]
 resume = None
 positionals = []
 after_ddash = False
@@ -178,6 +187,9 @@ if "__HANG__" in prompt:
 if "__SLOW__" in prompt:
     import time as _t
     _t.sleep(float(os.environ.get("FAKE_SLEEP", "0.6")))
+if "__SLOWAGY__" in prompt and is_agy:
+    import time as _t
+    _t.sleep(60)
 if "__PLAIN__" in prompt:
     out("plain text output, no json\n" + text + "\n"); sys.exit(0)
 if "__WRITE__:" in prompt:
@@ -212,6 +224,20 @@ if is_pi:
     out(json.dumps({"type": "message_end", "message": msg}) + "\n")
     out(json.dumps({"type": "agent_end", "messages": [msg]}) + "\n")
     sys.exit(0)
+if is_claude and out_format == "stream-json":
+    # Mirrors the real event stream: system/assistant events, then the same result object
+    # that `--output-format json` prints on its own.
+    sid = "claude-sess-456"
+    out(json.dumps({"type": "system", "subtype": "init", "session_id": sid}) + chr(10))
+    out(json.dumps({"type": "assistant", "session_id": sid,
+                    "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}}) + chr(10))
+if is_agy and out_format == "stream-json":
+    cid = "agy-conv-123"
+    out(json.dumps({"event": "init", "conversation_id": cid, "init": {}}) + chr(10))
+    out(json.dumps({"event": "step_update",
+                    "step_update": {"conversation_id": cid, "step_index": 0, "state": "DONE",
+                                    "step_type": "tool_call"}}) + chr(10))
+
 if is_claude:
     payload = {"type": "result", "subtype": "error_during_execution" if status_error else "success",
                "is_error": status_error, "result": text, "session_id": "claude-sess-456", "num_turns": 2,
@@ -224,6 +250,8 @@ else:
     payload = {"conversation_id": "agy-conv-123", "status": "ERROR" if status_error else "SUCCESS", "response": text,
                "duration_seconds": 0.1, "num_turns": 2,
                "usage": {"input_tokens": 100, "output_tokens": 7, "total_tokens": 107}}
+if is_agy and out_format == "stream-json":
+    payload = {"event": "result", "result": payload}
 out(json.dumps(payload) + "\n")
 '''
 
@@ -432,7 +460,7 @@ class TestAntigravityExecution(BridgeTestCase):
         self.assertIn("--- harness response ---", text)
         args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
         self.assertIn("--dangerously-skip-permissions", args_line)
-        self.assertIn("--output-format json", args_line)
+        self.assertIn("--output-format stream-json", args_line)  # streaming is the default
         self.assertIn("--print-timeout 960s", args_line)  # 900 + 60s margin
         self.assertIn("--model fake-model-high", args_line)
         self.assertIn("FAKE_PROMPT_SOURCE: arg", text)
@@ -589,7 +617,7 @@ class TestClaudeCodeExecution(BridgeTestCase):
         args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
         self.assertTrue(args_line.startswith("FAKE_ARGS: -p <PROMPT> "), args_line)  # boolean -p, positional prompt
         self.assertIn("--dangerously-skip-permissions", args_line)
-        self.assertIn("--output-format json", args_line)
+        self.assertIn("--output-format stream-json", args_line)
         self.assertNotIn("--print-timeout", args_line)  # claude has no print timeout flag
         self.assertIn("FAKE_CLAUDECODE: unset", text)  # parent session identity is hidden from the child
         self.assertIn("FAKE_DEPTH: 1", text)
@@ -866,6 +894,15 @@ class TestConsult(BridgeTestCase):
         self.assertIn("--mode plan", args_line)
         self.assertNotIn("--dangerously-skip-permissions", args_line)
         self.assertIn("read-only consultation", text)
+        self.assertIn("not a sandbox", text)  # the claim is about edit tools, not containment
+
+    async def test_a_consultation_that_changes_files_says_so(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session() as session:
+            text = await self.call(session, "consult_antigravity", prompt="__WRITE__:sneaky.txt")
+        self.assertIn("WARNING", text)
+        self.assertIn("supposed to change nothing", text)
+        self.assertIn("sneaky.txt", text)
 
     async def test_each_harness_gets_its_own_read_only_flags(self) -> None:
         expected = {
@@ -883,6 +920,78 @@ class TestConsult(BridgeTestCase):
             await self.call(session, "consult_claude_code", prompt="opinion please")
             listing = await self.call(session, "list_runs")
         self.assertIn("consult", listing)
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestStreamingProgress(BridgeTestCase):
+    async def test_claude_is_asked_for_an_event_stream_and_still_parses(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_claude_code", prompt="do it")
+        args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
+        self.assertIn("--output-format stream-json", args_line)
+        self.assertIn("--verbose", args_line)  # print mode refuses stream-json without it
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("Conversation ID: claude-sess-456", text)
+        self.assertIn("cost=$0.0123", text)  # the terminal result object is still parsed in full
+
+    async def test_agy_is_asked_for_an_event_stream_and_still_parses(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="do it")
+        args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
+        self.assertIn("--output-format stream-json", args_line)
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("Conversation ID: agy-conv-123", text)
+        self.assertIn("tokens in/out=100/7", text)
+
+    async def test_streaming_can_be_turned_off_and_the_object_mode_still_works(self) -> None:
+        async with self.session(BRIDGE_STREAM_PROGRESS="0") as session:
+            text = await self.call(session, "delegate_to_claude_code", prompt="do it")
+        args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
+        self.assertIn("--output-format json", args_line)
+        self.assertNotIn("stream-json", args_line)
+        self.assertNotIn("--verbose", args_line)
+        self.assertIn("Conversation ID: claude-sess-456", text)
+
+    def test_event_summaries_cover_every_harness_dialect(self) -> None:
+        cases = [
+            ({"event": "step_update", "step_update": {"step_type": "tool_call", "state": "RUNNING"}},
+             "step_update tool_call RUNNING"),
+            ({"event": "step_update", "step_update": {"tool": "view_file"}}, "running view_file"),
+            ({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}},
+             "running Bash"),
+            ({"type": "text", "part": {"tool": "edit"}}, "running edit"),
+            ({"type": "system", "subtype": "init"}, "starting"),
+            ({"type": "result", "subtype": "success"}, "finishing"),
+            ({"type": "system", "subtype": "informational"}, ""),   # noise, keeps the previous line
+            ({"type": "rate_limit_event"}, ""),
+        ]
+        for event, expected in cases:
+            self.assertEqual(bridge._ActivityTracker()._describe_event(event), expected, event)
+
+    def test_a_real_claude_event_sequence_reads_as_progress(self) -> None:
+        """Replays the shape captured from a real `claude --output-format stream-json` run."""
+        stream = [
+            {"type": "system", "subtype": "hook_started"},
+            {"type": "system", "subtype": "init"},
+            {"type": "system", "subtype": "informational"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}},
+            {"type": "rate_limit_event"},
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+            {"type": "result", "subtype": "success"},
+        ]
+        tracker = bridge._ActivityTracker()
+        seen = []
+        for event in stream:
+            tracker.feed((json.dumps(event) + "\n").encode())
+            seen.append(tracker.describe())
+        # noise never overwrites a meaningful line, and the tool is named while it runs
+        self.assertEqual(seen[0], "")
+        self.assertEqual(seen[2], "starting", "an informational event must not clobber 'starting'")
+        self.assertEqual(seen[4], "running Bash")
+        self.assertEqual(seen[5], "running Bash", "a rate-limit event must not clobber the tool")
+        self.assertEqual(seen[6], "Bash finished")
+        self.assertEqual(seen[7], "finishing")
 
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
@@ -948,6 +1057,22 @@ class TestConsultPanel(BridgeTestCase):
         self.assertIn("2 of 2 harness(es) answered", panel)
         self.assertNotIn("working tree busy", panel)
         self.assertLess(elapsed, 1.5, "a read-only panel must not queue behind a delegation")
+
+    async def test_one_slow_harness_does_not_hold_the_others_hostage(self) -> None:
+        # antigravity sleeps far past the grace period; the panel must return without it
+        # rather than waiting out timeout_seconds.
+        async with self.session(BRIDGE_PANEL_GRACE="1", FAKE_SLEEP="0") as session:
+            start = time.monotonic()
+            text = await self.call(
+                session, "consult_many", prompt="__SLOWAGY__ review this",
+                harnesses=["antigravity", "claude_code"], timeout_seconds=120,
+            )
+            elapsed = time.monotonic() - start
+        self.assertIn("1 of 2 harness(es) answered", text)
+        self.assertIn("did not finish in time: antigravity", text)
+        self.assertIn("gave up", text)
+        self.assertIn("--- claude_code says ---", text)
+        self.assertLess(elapsed, 20, f"panel waited {elapsed:.1f}s instead of giving up after the grace")
 
     async def test_the_panel_and_each_answer_are_retrievable_afterwards(self) -> None:
         async with self.session() as session:
@@ -1074,7 +1199,7 @@ class TestHelpers(unittest.TestCase):
         self.assertIsNone(stdin)
         self.assertEqual(argv[:3], ["/bin/agy", "-p", "do it"])
         self.assertIn("--dangerously-skip-permissions", argv)
-        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         self.assertEqual(argv[argv.index("--print-timeout") + 1], "960s")
 
     def test_build_argv_claude_defaults_and_resume(self) -> None:

@@ -968,6 +968,33 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         target = Path(link)
         report(target.is_symlink() and target.resolve() in known, f"delegating subagent linked at {target}")
 
+    print("state")
+    try:
+        server = _server_module()
+        journal = server.journal_path()
+        state = server.state_dir()
+        try:
+            state.mkdir(parents=True, exist_ok=True)
+            probe = state / ".doctor-write-test"
+            probe.write_text("")
+            probe.unlink()
+            writable = True
+        except OSError:
+            writable = False
+        report(writable, f"state directory writable: {state}")
+        runs = server.read_journal()
+        size = sum(f.stat().st_size for f in server.runs_dir().glob("*") if f.is_file()) if server.runs_dir().is_dir() else 0
+        print(f"  [ok] {len(runs)} run(s) journalled in {journal} ({size / 1024:.0f} KiB of reports)")
+        roots = server.allowed_dirs()
+        print(f"  [ok] delegation confined to: {', '.join(str(r) for r in roots) if roots else 'anywhere (BRIDGE_ALLOWED_DIRS unset)'}")
+        # A crash during an isolated run leaves its worktree on disk and registered in the repo.
+        leftovers = sorted((state / "worktrees").glob("*")) if (state / "worktrees").is_dir() else []
+        report(not leftovers, f"no leftover isolation worktrees ({len(leftovers)} found)")
+        for path in leftovers[:5]:
+            print(f"         {path}  -> remove with: git -C <repo> worktree remove --force {path}")
+    except SystemExit as exc:
+        report(False, f"run journal unavailable: {exc}")
+
     instruction_files = cfg.get("instruction_files") or []
     if instruction_files:
         print("instructions")

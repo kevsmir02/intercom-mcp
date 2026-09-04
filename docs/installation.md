@@ -2,6 +2,14 @@
 
 How to install, update, and remove intercom. For the one-line install, see the [README](../README.md).
 
+## Supported platform
+
+**Linux only.** That is where intercom is developed, tested and run: `install.sh` is bash, the setup
+wizard's checkbox picker needs a POSIX terminal, and killing a harness's process tree walks `/proc`.
+A `ps` fallback exists for systems without `/proc` and should make macOS work, but nothing is tested
+there. Windows is not supported: only the `taskkill` path would run, and it skips the graceful stop.
+CI runs Linux across Python 3.10-3.14.
+
 ## Installer options
 
 | Form | Effect |

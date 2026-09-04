@@ -80,8 +80,10 @@ choosing a harness by what has actually been working and what it has been costin
 - `pi`: the pi coding agent, provider configurable (Google by default).
 
 Only harnesses whose tools appear are enabled; call the matching `check_<harness>_health`
-first. Pick by remaining quota and by which harness already holds context on the codebase.
-On a quota roadblock, resend the same brief to another harness.
+first. To pick between them, call `list_runs()`: it ends with a per-harness rollup of recent
+success rate, median duration, cost, and whether that harness has just been hitting quota or
+authentication trouble. Otherwise prefer whichever already holds context on the codebase. On
+a quota roadblock, resend the same brief to another harness.
 
 ## Keeping the main context clean
 

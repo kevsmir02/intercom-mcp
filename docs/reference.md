@@ -62,8 +62,10 @@ consult_many(prompt="<the plan, and what you want attacked>",
 
 - **Parallel.** The panel costs the slowest answer, not the sum. Two harnesses answering in ~45s
   each return together in ~45s.
-- **Read-only, and never queued.** Each answer is a `consult`, so nothing can be edited, and a panel
-  neither waits for a running delegation nor blocks one.
+- **Read-only, and never queued.** Each answer is a `consult`, so the harness's edit tools are off and
+  a panel neither waits for a running delegation nor blocks one. Read-only is a permission setting,
+  not a sandbox: the harness can still run commands, and every report carries a change summary that
+  says so if the tree moved anyway.
 - **Independent.** The harnesses see the repository but not each other's answers and not your
   conversation, so two of them raising the same objection is real signal rather than agreement. Put
   the plan itself in the prompt.
@@ -73,6 +75,10 @@ consult_many(prompt="<the plan, and what you want attacked>",
   round is one tool call and nobody is told the plan twice.
 - **Compact by default.** Each answer is capped at a share of `BRIDGE_MAX_OUTPUT_CHARS`; the panel
   and every individual answer are journalled, so `get_run("<run id>")` returns any of them in full.
+- **No hostages.** Once the first harness answers, the rest have `BRIDGE_PANEL_GRACE` seconds
+  (default 120) to finish. Stragglers are stopped, their process trees killed, and their row reads
+  `gave up` -- one hung harness cannot hold the answers that did arrive for the whole
+  `timeout_seconds`. Ask it on its own afterwards with `consult_<harness>`.
 
 A partly failed panel still returns `[SUCCESS]`: one answer is an answer, and the table says which
 harness is missing and why.
@@ -111,15 +117,34 @@ intercom runs --limit 10 --harness claude_code   # or list_runs() from the orche
 intercom show 20260904T101500Z-1a2b3c4d          # or get_run("...")
 ```
 
+Both listings end with a per-harness rollup -- runs, success rate, median duration, cost, and a
+warning when recent runs hit quota or authentication trouble. That is what "pick the harness with
+remaining quota" should be read from, rather than guessed:
+
+```
+by harness (use this to choose one: recent success rate, speed and cost)
+harness       runs   ok  fail  timeout   median      cost  recent trouble
+antigravity     12   12     0        0    44.0s         -
+claude_code      7    5     2        0     6.5s   $1.2400  2 of the last 5 runs hit quota/rate limit -> check_claude_code_health
+```
+
 ## Long-running delegations
 
 A delegation's own limit is `timeout_seconds` (default 900, up to 86400). The orchestrator also
 applies its own timeout to every MCP tool call, which can be shorter. To stop a long delegation from
 being cut off by the orchestrator, the server emits a progress notification every
 `BRIDGE_HEARTBEAT_SECONDS` (default 15), carrying the elapsed time and the harness's most recent
-output line, so a long run shows what it is doing rather than only that it is alive. OpenCode resets
+activity, so a long run shows what it is doing rather than only that it is alive. OpenCode resets
 its tool-call timer on each one, so the call survives for the whole delegation, and `timeout_seconds`
 stays the real bound.
+
+For that to say anything, the harness has to emit progress as it goes. `opencode` and `pi` already
+stream events. `agy` and `claude` print a single JSON object at the very end, so they are asked for
+their event streams instead (`--output-format stream-json`, plus `--verbose` for claude, which
+refuses stream-json in print mode without it). The terminal result event carries exactly the object
+their non-streaming mode prints, so reports are unchanged -- only the progress messages get better,
+showing the tool each harness is currently running. `BRIDGE_STREAM_PROGRESS=0` returns them to
+single-object mode.
 
 - **OpenCode**: the generated config sets `mcp.intercom.timeout` to three hours as a backstop; the
   heartbeat handles anything longer.
@@ -131,15 +156,18 @@ Set `BRIDGE_HEARTBEAT_SECONDS=0` to disable the heartbeat.
 ## Harness facts the bridge relies on
 
 - `agy` (1.1.24 and 1.1.25): headless mode is `-p <prompt>`; auto-approve is
-  `--dangerously-skip-permissions`; read-only mode is `--mode plan`; print mode has its own
+  `--dangerously-skip-permissions`; read-only mode is `--mode plan`; `--output-format stream-json`
+  emits `{"event": <name>, <name>: {...}}` lines ending in a `result` event whose payload is the
+  plain-json object; print mode has its own
   `--print-timeout` (default 5m) which the bridge raises above `timeout_seconds`; there is no `auth`
   subcommand, so `agy models` is the auth probe; resume is `--conversation <id>`.
   **`agy` cannot take the prompt on stdin** -- `-p` is a value flag and `-p ""` with a piped prompt
   answers `Error: empty prompt` -- so a brief too large for the command line (120 000 bytes) is
   rejected with `[INVALID_ARGUMENT]` rather than sent without a prompt.
 - `claude` (2.1.259): `-p` is a boolean flag with the prompt as a positional argument or on stdin;
-  auto-approve is `--dangerously-skip-permissions`; read-only mode is `--permission-mode plan`; no print
-  timeout flag; `claude auth status --json` is the auth probe; resume is `--resume <id>`. The bridge hides the parent session's `CLAUDECODE` and
+  auto-approve is `--dangerously-skip-permissions`; read-only mode is `--permission-mode plan`;
+  `--output-format stream-json` **requires `--verbose`** in print mode and ends with the same
+  `{"type": "result", ...}` object that plain json mode prints; no print timeout flag; `claude auth status --json` is the auth probe; resume is `--resume <id>`. The bridge hides the parent session's `CLAUDECODE` and
   `CLAUDE_CODE_SESSION_ID`-style variables from the child so it starts as an independent session.
 - `opencode` (1.18.x): headless mode is `opencode run <prompt>` (or the prompt on stdin); auto-approve is
   `--auto`; read-only mode is the built-in `--agent plan`; structured output is `--format json`, a
@@ -177,5 +205,7 @@ Set these in the orchestrator's environment block, or let `intercom setup` manag
 | `BRIDGE_ALLOWED_DIRS` | (anywhere) | `:`-separated roots that `working_dir` must sit inside |
 | `BRIDGE_REDACT_ENV` | secret-ish names | Regex for env names whose values are masked in reports |
 | `BRIDGE_KEEP_RUNS` | `200` | Run records kept on disk (`0` keeps everything) |
+| `BRIDGE_STREAM_PROGRESS` | `1` | Ask `agy`/`claude` for an event stream so progress shows live activity (`0` disables) |
+| `BRIDGE_PANEL_GRACE` | `120` | Seconds a `consult_many` panel waits for stragglers after its first answer (`0` disables) |
 | `INTERCOM_STATE_DIR` | `$XDG_STATE_HOME/intercom` | Where the run journal and patches live |
 | `BRIDGE_LOG_LEVEL` | `INFO` | Server log level (stderr) |

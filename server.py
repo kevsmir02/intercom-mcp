@@ -167,6 +167,15 @@ def extra_strip_env() -> list[str]:
     return [name.strip() for name in _env("BRIDGE_STRIP_ENV").split(",") if name.strip()]
 
 
+def stream_progress() -> bool:
+    """Ask agy/claude for an event stream so the heartbeat can show live activity.
+
+    Their single-object JSON mode prints nothing until the run ends, which makes a long
+    delegation a black box. Set BRIDGE_STREAM_PROGRESS=0 to fall back to it.
+    """
+    return _env("BRIDGE_STREAM_PROGRESS", default="1").lower() not in ("0", "false", "no", "off")
+
+
 def keep_runs() -> int:
     return _env_int("BRIDGE_KEEP_RUNS", DEFAULT_RUNS_KEPT, 0)
 
@@ -537,11 +546,12 @@ class _ActivityTracker:
     way the newest meaningful line tells the caller the run is alive and roughly where it is.
     """
 
-    __slots__ = ("_partial", "_latest", "lines")
+    __slots__ = ("_partial", "_latest", "_last_tool", "lines")
 
     def __init__(self) -> None:
         self._partial = b""
         self._latest = ""
+        self._last_tool = ""
         self.lines = 0
 
     def feed(self, chunk: bytes) -> None:
@@ -558,21 +568,71 @@ class _ActivityTracker:
             if summary:
                 self._latest = summary
 
-    @staticmethod
-    def _summarise(line: str) -> str:
+    def _summarise(self, line: str) -> str:
         if line.startswith("{") and len(line) < 200_000:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 event = None
             if isinstance(event, dict):
-                kind = str(event.get("type") or event.get("event") or "event")
-                part = event.get("part") if isinstance(event.get("part"), dict) else {}
-                message = event.get("message") if isinstance(event.get("message"), dict) else {}
-                name = part.get("tool") or event.get("tool") or event.get("name") or message.get("role")
-                detail = f" {name}" if isinstance(name, str) and name else ""
-                return f"{kind}{detail}"[:ACTIVITY_LINE_MAX]
+                return self._describe_event(event)
         return line[:ACTIVITY_LINE_MAX]
+
+    # Events that say nothing about progress and would crowd out the ones that do.
+    _NOISE = {("system", "hook_started"), ("system", "hook_response"), ("system", "informational")}
+
+    @staticmethod
+    def _tool_name(event: dict[str, Any], message: dict[str, Any]) -> str:
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        for candidate in (part.get("tool"), event.get("tool"), event.get("name")):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                    return str(block["name"])
+        return ""
+
+    def _describe_event(self, event: dict[str, Any]) -> str:
+        """A short phrase for what the harness is doing, across the four event dialects.
+
+        Returns "" for events that carry no progress signal, so the heartbeat keeps showing
+        the last thing that did.
+        """
+        # agy: {"event": "step_update", "step_update": {...}}
+        kind = event.get("event")
+        if isinstance(kind, str):
+            payload = event.get(kind) if isinstance(event.get(kind), dict) else {}
+            tool = payload.get("tool") or payload.get("tool_name")
+            if isinstance(tool, str) and tool:
+                self._last_tool = tool
+                return f"running {tool}"[:ACTIVITY_LINE_MAX]
+            bits = [str(payload[k]) for k in ("step_type", "state") if payload.get(k)]
+            return " ".join([kind, *bits])[:ACTIVITY_LINE_MAX]
+
+        # claude / opencode / pi: {"type": ..., ...}
+        kind = str(event.get("type") or "event")
+        subtype = str(event.get("subtype") or "")
+        if kind == "rate_limit_event" or (kind, subtype) in self._NOISE:
+            return ""
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        tool = self._tool_name(event, message)
+        if tool:
+            self._last_tool = tool
+            return f"running {tool}"[:ACTIVITY_LINE_MAX]
+        content = message.get("content")
+        if kind == "user" and isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            return f"{self._last_tool} finished" if self._last_tool else "tool finished"
+        if kind in ("assistant", "text"):
+            return "writing"
+        if kind == "system" and subtype == "init":
+            return "starting"
+        if kind == "result":
+            return "finishing"
+        return f"{kind} {subtype}".strip()[:ACTIVITY_LINE_MAX]
 
     def describe(self) -> str:
         return redact(self._latest)
@@ -788,6 +848,8 @@ class Harness:
     readonly_flags: tuple[str, ...]  # put the harness in a plan/no-edit mode (consult_* tools)
     verified_version: str  # the release this adapter's flags were checked against
     json_flags: tuple[str, ...]
+    # Flags for the harness's event-stream mode, when it has one that differs from json_flags.
+    stream_flags: tuple[str, ...]
     output_format_flag: str
     timeout_flag: str | None
     resume_flag: str
@@ -812,6 +874,12 @@ class Harness:
 
     def default_flags(self) -> list[str]:
         return _env_flags(f"{self.env_prefix}_DEFAULT_FLAGS", "")
+
+    def output_flags(self) -> tuple[str, ...]:
+        """The structured-output flags to use: the streaming pair when it exists and is wanted."""
+        if self.stream_flags and stream_progress():
+            return self.stream_flags
+        return self.json_flags
 
     def child_env(self) -> dict[str, str]:
         """Parent environment (auth, PATH, HOME) minus session-identity variables, plus the depth marker."""
@@ -872,6 +940,27 @@ def _parse_claude_json(data: dict[str, Any]) -> Outcome:
         model=", ".join(str(k) for k in model_usage) or None,
         notes=notes,
     )
+
+
+def _parse_claude_stream(stdout: str) -> Outcome | None:
+    """claude --output-format stream-json: NDJSON ending in the same object `json` mode prints."""
+    final: dict[str, Any] | None = None
+    for event in _iter_json_lines(stdout):
+        if event.get("type") == "result":
+            final = event
+    return _parse_claude_json(final) if final is not None else None
+
+
+def _parse_agy_stream(stdout: str) -> Outcome | None:
+    """agy --output-format stream-json: events shaped {"event": <name>, <name>: {...}}.
+
+    The terminal result payload is byte-for-byte what `--output-format json` prints.
+    """
+    final: dict[str, Any] | None = None
+    for event in _iter_json_lines(stdout):
+        if event.get("event") == "result" and isinstance(event.get("result"), dict):
+            final = event["result"]
+    return _parse_agy_json(final) if final is not None else None
 
 
 def _auth_agy(result: ProcessResult) -> tuple[bool, str, str]:
@@ -1060,6 +1149,7 @@ def _auth_pi(result: ProcessResult) -> tuple[bool, str, str]:
 HARNESSES: dict[str, Harness] = {
     "antigravity": Harness(
         key="antigravity",
+        stream_flags=("--output-format", "stream-json"),
         # Verified 2026-09-04: `-p` is a *value* flag; `-p ""` with a piped prompt returns
         # "Error: empty prompt", so agy cannot take the brief on stdin.
         stdin_prompt=False,
@@ -1086,9 +1176,12 @@ HARNESSES: dict[str, Harness] = {
         usage_error_re=r"unexpected argument|unknown flag|flag provided but not defined|usage of agy",
         parse_auth=_auth_agy,
         parse_json=_parse_agy_json,
+        parse_stream=_parse_agy_stream,
     ),
     "claude_code": Harness(
         key="claude_code",
+        # Verified 2026-09-04: print mode refuses stream-json without --verbose.
+        stream_flags=("--output-format", "stream-json", "--verbose"),
         stdin_prompt=True,  # `-p` is boolean; the prompt may be a positional or piped
         readonly_flags=("--permission-mode", "plan"),
         verified_version="2.1.259",
@@ -1119,9 +1212,11 @@ HARNESSES: dict[str, Harness] = {
         usage_error_re=r"error: unknown option|error: missing required argument|error: option '.*' argument missing|error: too many arguments",
         parse_auth=_auth_claude,
         parse_json=_parse_claude_json,
+        parse_stream=_parse_claude_stream,
     ),
     "opencode": Harness(
         key="opencode",
+        stream_flags=(),  # `--format json` is already a newline-delimited event stream
         stdin_prompt=True,  # `opencode run` with no message argument reads stdin
         readonly_flags=("--agent", "plan"),  # the built-in read-only agent
         verified_version="1.18",
@@ -1149,6 +1244,7 @@ HARNESSES: dict[str, Harness] = {
     ),
     "pi": Harness(
         key="pi",
+        stream_flags=(),  # `--mode json` is already a JSON-lines event stream
         stdin_prompt=True,  # `pi -p` reads the prompt from stdin when no positional is given
         readonly_flags=("--exclude-tools", "edit,write"),
         verified_version="0.84",
@@ -1178,15 +1274,19 @@ HARNESSES: dict[str, Harness] = {
 
 
 def parse_outcome(harness: Harness, stdout: str) -> Outcome:
-    if harness.parse_stream is not None:  # NDJSON event stream (opencode/pi)
+    """Event stream first, then a single result object, then the raw text.
+
+    Both are tried for every harness, so a report is still structured when streaming is
+    turned off (BRIDGE_STREAM_PROGRESS=0) or when a harness answers in the other shape.
+    """
+    if harness.parse_stream is not None:
         try:
             outcome = harness.parse_stream(stdout)
             if outcome is not None:
                 return outcome
         except Exception as exc:  # defensive: never let a schema surprise hide the raw output
-            log.warning("could not parse %s event stream (%s); falling back to raw text", harness.key, exc)
-        return Outcome(text=stdout, structured=False)
-    if harness.parse_json is not None:  # single JSON result object (agy/claude)
+            log.warning("could not parse %s event stream (%s); trying the object parser", harness.key, exc)
+    if harness.parse_json is not None:
         data = _extract_json_object(stdout)
         if data is not None:
             try:
@@ -1320,8 +1420,9 @@ def build_argv(
         argv += approve_flags
     if read_only and harness.readonly_flags and not _has_flag(user_flags, harness.readonly_flags[0]):
         argv += list(harness.readonly_flags)
-    if harness.json_flags and not _has_flag(user_flags, harness.output_format_flag):
-        argv += harness.json_flags
+    output_flags = harness.output_flags()
+    if output_flags and not _has_flag(user_flags, harness.output_format_flag):
+        argv += output_flags
     if harness.timeout_flag and not _has_flag(user_flags, harness.timeout_flag):
         argv += [harness.timeout_flag, f"{timeout_seconds + PRINT_TIMEOUT_MARGIN}s"]
     argv += user_flags
@@ -2032,9 +2133,23 @@ async def delegate(
             ("Run ID", f'{run_id}  (full report: get_run("{run_id}"); recent runs: list_runs())')
         ]
         if read_only:
+            # State the mechanism, not the outcome: the change summary below is the evidence.
             extra_meta.append(
-                ("Mode", f"read-only consultation ({shlex.join(harness.readonly_flags) or 'no edit flags'}); no files were changed")
+                (
+                    "Mode",
+                    f"read-only consultation ({shlex.join(harness.readonly_flags) or 'no edit flags'}, "
+                    "permission auto-approval off). This restricts the harness's own edit tools; it is "
+                    "not a sandbox, and the harness may still run commands.",
+                )
             )
+            if changes.attributed:
+                extra_meta.append(
+                    (
+                        "WARNING",
+                        f"this consultation was supposed to change nothing, but {len(changes.attributed)} "
+                        "path(s) changed during it. Review them before trusting this answer.",
+                    )
+                )
         if worktree is not None:
             patch_path = runs_dir() / f"{run_id}.patch"
             extra_meta.append(
@@ -2086,6 +2201,10 @@ async def delegate(
             "commits": changes.commits,
             "prompt_chars": len(prompt),
         }
+        if status != "success":
+            entry["cause"] = classify_failure(
+                harness, result.returncode, f"{outcome.text}\n{result.stdout}", result.stderr
+            )
         record_run(entry, report, patch)
         if record is not None:
             record.update(entry)
@@ -2360,10 +2479,11 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
     mcp.tool(
         name=consult_tool.__name__,
         description=(
-            f"Ask {harness.label} a question about the code WITHOUT letting it edit anything: it runs in the "
-            f"harness's read-only mode ({shlex.join(harness.readonly_flags) or 'no-edit flags'}) with permission "
-            "auto-approval off. Use it for a second opinion, a design review, a diff review or a bug hunt from a "
-            "model other than your own. Same report prefixes as delegate; no files are changed."
+            f"Ask {harness.label} a question about the code instead of asking it to change the code: it runs in "
+            f"the harness's read-only mode ({shlex.join(harness.readonly_flags) or 'no-edit flags'}) with "
+            "permission auto-approval off, so its edit tools are disabled. Use it for a second opinion, a design "
+            "review, a diff review or a bug hunt from a model other than your own. Same report prefixes as "
+            "delegate. The report still carries a change summary, and says so if anything did change."
         ),
     )(consult_tool)
     mcp.tool(
@@ -2377,6 +2497,16 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
 
 
 PANEL_MIN_RESPONSE_CHARS = 2_000
+DEFAULT_PANEL_GRACE_SECONDS = 120
+
+
+def panel_grace_seconds() -> float:
+    """How long a panel keeps waiting for stragglers after its first answer arrives.
+
+    Without this one hung harness holds every answer hostage for the whole timeout_seconds.
+    0 disables the grace, leaving timeout_seconds as the only bound.
+    """
+    return float(_env_int("BRIDGE_PANEL_GRACE", DEFAULT_PANEL_GRACE_SECONDS, 0))
 
 
 def _one_line(text: str, limit: int) -> str:
@@ -2495,16 +2625,53 @@ async def consult_many(
                 return
 
     beat_task = asyncio.ensure_future(beat())
+    tasks = {asyncio.ensure_future(one(key)): key for key in keys}
+    results: list[tuple[str, str, dict[str, Any]]] = []
+    abandoned: list[str] = []
+    grace = panel_grace_seconds()
     try:
-        # The whole point: N harnesses think at the same time, so the panel costs the slowest
-        # answer rather than the sum of them.
-        results = await asyncio.gather(*(one(key) for key in keys))
+        # N harnesses think at the same time, so the panel costs the slowest answer rather
+        # than the sum. Once the first one is back the rest get `grace` seconds, so a single
+        # hung harness cannot hold the answers that did arrive for the whole timeout.
+        pending = set(tasks)
+        deadline = started + timeout_seconds
+        grace_applied = False
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            finished_now, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not finished_now:
+                break  # deadline hit with nothing new
+            for task in finished_now:
+                key = tasks[task]
+                try:
+                    results.append(task.result())
+                except Exception as exc:  # a crash in the bridge itself, not in the harness
+                    log.warning("consult of %s raised: %s", key, exc)
+                    results.append((key, f"[ROADBLOCK / FAILURE] consulting {key} raised {exc!r}", {}))
+            if pending and grace > 0 and not grace_applied:
+                grace_applied = True  # the first answer is in; the rest are on the clock
+                deadline = min(deadline, time.monotonic() + grace)
+        for task in pending:
+            abandoned.append(tasks[task])
+            task.cancel()  # cancellation kills that harness's process tree
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
     finally:
         done.set()
         beat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await beat_task
+        for task in tasks:
+            if not task.done():  # pragma: no cover - belt and braces on an early exit
+                task.cancel()
     elapsed = time.monotonic() - started
+    # Report in the order asked, not the order they finished.
+    order = {key: index for index, key in enumerate(keys)}
+    results.sort(key=lambda item: order.get(item[0], len(order)))
 
     budget = max(PANEL_MIN_RESPONSE_CHARS, max_output_chars() // max(1, len(keys)))
     rows: list[dict[str, Any]] = []
@@ -2531,11 +2698,22 @@ async def consult_many(
             body = (body + "\n\n" if body.strip() else "") + truncate(report, budget)
         sections.append((f"{key} says", truncate(body, budget)))
 
+    for key in abandoned:
+        rows.append({"harness": key, "status": "gave up", "duration_seconds": round(elapsed, 2)})
+        sections.append(
+            (
+                f"{key} says",
+                f"(no answer: {key} was still working after the panel's grace period "
+                f"({int(panel_grace_seconds())}s past the first answer) and was stopped. Ask it on its own "
+                f"with consult_{key}, or raise BRIDGE_PANEL_GRACE.)",
+            )
+        )
+
     panel_id = new_run_id()
     prefix = "[SUCCESS]" if answered else "[ROADBLOCK / FAILURE]"
     headline = (
-        f"{answered} of {len(keys)} harness(es) answered in {_fmt_duration(elapsed)} "
-        f"(run in parallel; the slowest one set this time)"
+        f"{answered} of {len(keys)} harness(es) answered in {_fmt_duration(elapsed)} (run in parallel)"
+        + (f"; {len(abandoned)} did not finish in time: {', '.join(abandoned)}" if abandoned else "")
     )
     sections.insert(0, ("panel", _panel_table(rows)))
     sections.append(
@@ -2576,6 +2754,7 @@ async def consult_many(
             "timeout_seconds": timeout_seconds,
             "answered": answered,
             "of": len(keys),
+            "abandoned": abandoned,
             "child_runs": [row.get("run_id") for row in rows if row.get("run_id")],
             "tokens_in": sum(row.get("tokens_in") or 0 for row in rows) or None,
             "tokens_out": sum(row.get("tokens_out") or 0 for row in rows) or None,
@@ -2586,6 +2765,48 @@ async def consult_many(
         report,
     )
     return report
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _harness_rollup(records: list[dict[str, Any]]) -> str:
+    """Per-harness record, so 'pick by remaining quota' can be read off instead of guessed."""
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for entry in records:
+        for key in str(entry.get("harness", "?")).split(","):  # a panel names several
+            by_key.setdefault(key.strip(), []).append(entry)
+    if not by_key:
+        return ""
+    header = f"{'harness':12} {'runs':>5} {'ok':>4} {'fail':>5} {'timeout':>8} {'median':>8} {'cost':>9}  recent trouble"
+    lines = [header, "-" * len(header)]
+    for key in sorted(by_key):
+        runs = by_key[key]
+        ok = sum(1 for r in runs if r.get("status") == "success")
+        failed = sum(1 for r in runs if r.get("status") == "failure")
+        timed_out = sum(1 for r in runs if r.get("status") == "timeout")
+        median = _median([float(r.get("duration_seconds") or 0) for r in runs])
+        cost = sum(float(r.get("cost_usd") or 0) for r in runs)
+        # `records` arrives newest-first, so the first few are the most recent.
+        blockers = [
+            str(r.get("cause", ""))
+            for r in runs[:5]
+            if re.search(r"quota|rate limit|Authentication", str(r.get("cause", "")), re.IGNORECASE)
+        ]
+        trouble = ""
+        if blockers:
+            kind = "quota/rate limit" if re.search(r"quota|rate", blockers[0], re.I) else "authentication"
+            trouble = f"{len(blockers)} of the last {min(5, len(runs))} runs hit {kind} -> check_{key}_health"
+        lines.append(
+            f"{key:12} {len(runs):>5} {ok:>4} {failed:>5} {timed_out:>8} "
+            f"{f'{median:.1f}s':>8} {('$%.4f' % cost) if cost else '-':>9}  {trouble}"
+        )
+    return "\n".join(lines)
 
 
 def _format_runs(records: list[dict[str, Any]]) -> str:
@@ -2615,6 +2836,9 @@ def _format_runs(records: list[dict[str, Any]]) -> str:
         f"{len(records)} run(s): " + ", ".join(f"{count} {name}" for name, count in sorted(statuses.items()))
         + f" | {tokens} tokens | ${cost:.4f} recorded cost"
     )
+    rollup = _harness_rollup(records)
+    if rollup:
+        rows += ["", "by harness (use this to choose one: recent success rate, speed and cost)", rollup]
     return "\n".join(rows)
 
 
