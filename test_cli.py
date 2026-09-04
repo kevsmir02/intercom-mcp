@@ -190,8 +190,11 @@ class TestSetup(CliFixture):
         self.assertEqual((first.returncode, second.returncode), (0, 0), second.stdout + second.stderr)
         self.assertIn("skill already linked", second.stdout)
         log = self.mcp_log.read_text()
-        self.assertEqual(log.count("mcp add"), 2)  # re-registered, after a remove each time
-        self.assertGreaterEqual(log.count("mcp remove"), 2)
+        # A re-run must not tear down a registration that already points at our launcher:
+        # `claude mcp add` can fail, and the old remove-then-add left the user unregistered.
+        self.assertEqual(log.count("mcp add"), 1)
+        self.assertEqual(log.count("mcp remove"), 0)
+        self.assertIn("already registered", second.stdout)
 
     def test_rerun_preserves_existing_selection(self) -> None:
         first = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code", "--yes")
@@ -400,7 +403,60 @@ class TestSelectors(unittest.TestCase):
             builtins.input = saved_input
 
 
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX environment")
+class TestDeselection(CliFixture):
+    def test_deselecting_an_orchestrator_cleans_up_after_itself(self) -> None:
+        first = self.run_cli(
+            "setup", "--harness", "claude_code",
+            "--orchestrator", "claude_code", "--orchestrator", "opencode", "--yes",
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        claude_md = self.home / ".claude" / "CLAUDE.md"
+        self.assertTrue(self.mcp_marker.exists())
+        self.assertTrue(self.claude_agent_link.is_symlink())
+        self.assertTrue(self.skill_link.is_symlink())
+        self.assertIn(intercom.INSTRUCTION_START, claude_md.read_text())
+
+        second = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "opencode", "--yes")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("was deselected", second.stdout)
+        self.assertFalse(self.mcp_marker.exists(), "the Claude Code registration must be removed")
+        self.assertFalse(self.claude_agent_link.exists(), "its subagent link must be removed")
+        self.assertFalse(self.skill_link.exists(), "the now-stale skill link must be removed")
+        self.assertNotIn(intercom.INSTRUCTION_START, claude_md.read_text())
+
+        cfg = json.loads(self.config_json.read_text())
+        self.assertEqual(cfg["orchestrators"], ["opencode"])
+        self.assertNotIn(str(self.claude_agent_link), cfg["agent_links"])
+        self.assertNotIn(str(claude_md), cfg["instruction_files"])
+
+    def test_no_instructions_rerun_keeps_tracking_earlier_files(self) -> None:
+        self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code", "--yes")
+        claude_md = self.home / ".claude" / "CLAUDE.md"
+        self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code", "--yes", "--no-instructions")
+        cfg = json.loads(self.config_json.read_text())
+        self.assertIn(str(claude_md), cfg["instruction_files"])
+        self.assertIn(intercom.INSTRUCTION_START, claude_md.read_text())
+
+    def test_allowed_dir_is_stored_and_passed_to_the_server(self) -> None:
+        allowed = self.tmp / "sandbox"
+        allowed.mkdir()
+        result = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code",
+                              "--allowed-dir", str(allowed), "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cfg = json.loads(self.config_json.read_text())
+        self.assertEqual(cfg["env"]["BRIDGE_ALLOWED_DIRS"], str(allowed.resolve()))
+        env = intercom.build_serve_env(cfg, {})
+        self.assertEqual(env["BRIDGE_ALLOWED_DIRS"], str(allowed.resolve()))
+
+
 class TestServeEnv(unittest.TestCase):
+    def test_configured_env_is_passed_through_but_never_overrides_the_caller(self) -> None:
+        cfg = dict(intercom.default_config(), env={"BRIDGE_ALLOWED_DIRS": "/srv", "BRIDGE_KEEP_RUNS": "50"})
+        env = intercom.build_serve_env(cfg, {"BRIDGE_ALLOWED_DIRS": "/already/set"})
+        self.assertEqual(env["BRIDGE_ALLOWED_DIRS"], "/already/set")
+        self.assertEqual(env["BRIDGE_KEEP_RUNS"], "50")
+
     def test_build_serve_env_fills_only_unset_values(self) -> None:
         cfg = {"harnesses": ["claude_code"], "default_flags": {"claude_code": "--model sonnet", "antigravity": ""}, "max_depth": 3}
         env = intercom.build_serve_env(cfg, {"PATH": "/bin", "BRIDGE_MAX_DEPTH": "9"})
@@ -425,8 +481,48 @@ class TestServe(CliFixture, unittest.IsolatedAsyncioTestCase):
                 await session.initialize()
                 names = sorted(t.name for t in (await session.list_tools()).tools)
                 health = result_text(await session.call_tool("check_claude_code_health", {}))
-        self.assertEqual(names, ["check_claude_code_health", "delegate_to_claude_code"])
+        self.assertEqual(
+            names,
+            ["check_claude_code_health", "consult_claude_code", "delegate_to_claude_code", "get_run", "list_runs"],
+        )
         self.assertTrue(health.startswith("[HEALTH: READY]"), health)
+
+    async def test_isolated_run_is_journalled_and_applyable_from_the_shell(self) -> None:
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        setup = self.run_cli("setup", "--harness", "claude_code", "--orchestrator", "claude_code", "--yes")
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        project = self.tmp / "project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+        (project / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "-A"], cwd=project, check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "seed"],
+                       cwd=project, check=True)
+
+        params = StdioServerParameters(command=str(self.launcher), args=["serve"], env=self.env(BRIDGE_LOG_LEVEL="WARNING"))
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                report = result_text(await session.call_tool("delegate_to_claude_code", {
+                    "prompt": "__WRITE__:from_isolation.txt", "working_dir": str(project), "isolate": True,
+                }))
+        self.assertTrue(report.startswith("[SUCCESS]"), report)
+        run_id = next(ln.split()[2] for ln in report.splitlines() if ln.startswith("Run ID:"))
+        self.assertFalse((project / "from_isolation.txt").exists())
+
+        listing = self.run_cli("runs")
+        self.assertIn(run_id, listing.stdout)
+        shown = self.run_cli("show", run_id)
+        self.assertIn("[SUCCESS]", shown.stdout)
+        patch = self.run_cli("show", run_id, "--patch")
+        self.assertIn("from_isolation.txt", patch.stdout)
+
+        applied = self.run_cli("apply", run_id, "--repo", str(project))
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertTrue((project / "from_isolation.txt").exists(), "the patch must land in the real tree")
+        missing = self.run_cli("show", "20200101T000000Z-deadbeef")
+        self.assertNotEqual(missing.returncode, 0)
 
 
 if __name__ == "__main__":

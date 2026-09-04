@@ -4,6 +4,9 @@
     intercom setup       choose harnesses and orchestrators, register the server, link the skill
     intercom doctor      health of the enabled harnesses plus registration checks
     intercom serve       run the MCP server (this is what the orchestrator registrations invoke)
+    intercom runs        list recent delegations (harness, status, duration, tokens, cost)
+    intercom show        print the stored report or patch of one run
+    intercom apply       apply an isolated run's patch to a working tree
     intercom test        run the hermetic test suite
     intercom update      pull the latest version and reinstall the dependency
     intercom uninstall   remove registrations, skill links, launcher and configuration
@@ -134,6 +137,7 @@ def default_config() -> dict[str, Any]:
         "agent_links": [],
         "claude_profiles": [],
         "instruction_files": [],
+        "env": {},
     }
 
 
@@ -167,6 +171,10 @@ def build_serve_env(cfg: dict[str, Any], base_env: dict[str, str]) -> dict[str, 
         if key in HARNESS_ENV_PREFIX and str(flags).strip():
             env.setdefault(f"{HARNESS_ENV_PREFIX[key]}_DEFAULT_FLAGS", str(flags).strip())
     env.setdefault("BRIDGE_MAX_DEPTH", str(cfg.get("max_depth", 1)))
+    # Anything else the user configured (BRIDGE_ALLOWED_DIRS, <H>_BIN, BRIDGE_KEEP_RUNS, ...).
+    for name, value in (cfg.get("env") or {}).items():
+        if isinstance(name, str) and name.strip() and str(value).strip():
+            env.setdefault(name.strip(), str(value).strip())
     return env
 
 
@@ -326,14 +334,15 @@ def harness_health(keys: list[str]) -> dict[str, tuple[str, str]]:
     """key -> (status word, headline) from the server's own health probes."""
     server = _server_module()
 
+    async def one(key: str) -> tuple[str, tuple[str, str]]:
+        report = await server.health(server.HARNESSES[key])
+        first = report.splitlines()[0]
+        status = first[first.find(":") + 1 : first.find("]")].strip()
+        return key, (status, first[first.find("]") + 1 :].strip())
+
     async def run() -> dict[str, tuple[str, str]]:
-        out: dict[str, tuple[str, str]] = {}
-        for key in keys:
-            report = await server.health(server.HARNESSES[key])
-            first = report.splitlines()[0]
-            status = first[first.find(":") + 1 : first.find("]")].strip()
-            out[key] = (status, first[first.find("]") + 1 :].strip())
-        return out
+        # Each probe can burn a 45s timeout; run every harness at once so doctor stays quick.
+        return dict(await asyncio.gather(*(one(key) for key in keys)))
 
     return asyncio.run(run())
 
@@ -478,10 +487,7 @@ def antigravity_registered() -> bool:
 
 def register_claude_profile(config_dir: str) -> str:
     """Register and link intercom for an additional Claude profile (CLAUDE_CONFIG_DIR)."""
-    _claude("mcp", "remove", "-s", "user", SERVER_KEY, config_dir=config_dir)
-    result = _claude("mcp", "add", "-s", "user", SERVER_KEY, "--", str(launcher_path()), "serve", config_dir=config_dir)
-    if result.returncode != 0:
-        raise SystemExit(f"error: `claude mcp add` for {config_dir} failed:\n{(result.stderr or result.stdout).strip()}")
+    _claude_add(config_dir, f"Claude profile {config_dir}")
     base = Path(os.path.expanduser(config_dir))
     link_skill(base / "skills" / SKILL_NAME)
     link_agent(base / "agents" / f"{AGENT_NAME}.md", AGENT_SRC["claude_code"])
@@ -502,12 +508,31 @@ def claude_profile_registered(config_dir: str) -> bool:
     return _claude("mcp", "get", SERVER_KEY, config_dir=config_dir).returncode == 0
 
 
-def register_claude() -> str:
-    _claude("mcp", "remove", "-s", "user", SERVER_KEY)  # ignore failure: it may not exist yet
-    result = _claude("mcp", "add", "-s", "user", SERVER_KEY, "--", str(launcher_path()), "serve")
+def _claude_add(config_dir: str | None, label: str) -> str:
+    """Register the launcher with Claude, replacing an existing entry only when it differs.
+
+    `claude mcp add` refuses a name that exists, so the old code removed first -- which left the
+    user with no registration at all whenever the add then failed.
+    """
+    existing = _claude("mcp", "get", SERVER_KEY, config_dir=config_dir)
+    launcher = str(launcher_path())
+    if existing.returncode == 0 and launcher in existing.stdout:
+        return f"`{SERVER_KEY}` already registered with {label} and pointing at {launcher}"
+    if existing.returncode == 0:
+        _claude("mcp", "remove", "-s", "user", SERVER_KEY, config_dir=config_dir)
+    result = _claude("mcp", "add", "-s", "user", SERVER_KEY, "--", launcher, "serve", config_dir=config_dir)
     if result.returncode != 0:
-        raise SystemExit(f"error: `claude mcp add` failed:\n{(result.stderr or result.stdout).strip()}")
-    return f"registered `{SERVER_KEY}` with Claude Code (user scope)"
+        detail = (result.stderr or result.stdout).strip()
+        recovery = "" if existing.returncode != 0 else (
+            f"\nthe previous registration was removed first; restore it with:\n"
+            f"  claude mcp add -s user {SERVER_KEY} -- {launcher} serve"
+        )
+        raise SystemExit(f"error: `claude mcp add` for {label} failed:\n{detail}{recovery}")
+    return f"registered `{SERVER_KEY}` with {label}"
+
+
+def register_claude() -> str:
+    return _claude_add(None, "Claude Code (user scope)")
 
 
 def unregister_claude() -> str:
@@ -598,7 +623,12 @@ def has_instructions(path: Path) -> bool:
 
 def skill_targets(orchestrators: list[str]) -> list[Path]:
     """Skill link dirs for the chosen orchestrators. ~/.claude/skills serves Claude Code and
-    OpenCode; ~/.agents/skills serves the Antigravity CLI."""
+    OpenCode; ~/.agents/skills serves the Antigravity CLI.
+
+    When both Claude Code and OpenCode are selected only ~/.claude/skills is linked, on purpose:
+    OpenCode reads that directory too, so linking ~/.config/opencode/skills as well would show
+    OpenCode the same skill twice.
+    """
     targets: list[Path] = []
     if "claude_code" in orchestrators or not orchestrators:
         targets.append(claude_skills_dir() / SKILL_NAME)
@@ -699,6 +729,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print()
 
     existing = load_config()
+    previous = {
+        "orchestrators": [o for o in existing.get("orchestrators", []) if o in ORCHESTRATOR_KEYS],
+        "skill_links": [str(link) for link in existing.get("skill_links") or []],
+        "agent_links": [str(link) for link in existing.get("agent_links") or []],
+        "instruction_files": [str(path) for path in existing.get("instruction_files") or []],
+    }
     has_config = config_path().exists()
     if has_config:
         say(f"existing configuration found at {config_path()}; your current selections are preserved as defaults")
@@ -722,7 +758,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             [(key, HARNESS_LABELS[key], key in default_harnesses) for key in HARNESS_KEYS],
         )
     if not harnesses:
-        raise SystemExit("error: no harness selected; install agy and/or claude, then rerun `intercom setup`")
+        raise SystemExit(
+            "error: no harness selected; install at least one of agy, claude, opencode or pi, "
+            "then rerun `intercom setup`"
+        )
     for key in harnesses:
         if not found[key]:
             warn(f"{HARNESS_LABELS[key]} is enabled but its binary is not on PATH; set {HARNESS_ENV_PREFIX[key]}_BIN or install it")
@@ -753,6 +792,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
             [(key, ORCHESTRATOR_LABELS[key], key in default_orch) for key in ORCHESTRATOR_KEYS],
         )
 
+    if args.allowed_dir is not None:
+        roots = [str(Path(os.path.expanduser(d)).resolve()) for d in args.allowed_dir]
+        env_overrides = dict(existing.get("env") or {})
+        if roots:
+            env_overrides["BRIDGE_ALLOWED_DIRS"] = os.pathsep.join(roots)
+        else:
+            env_overrides.pop("BRIDGE_ALLOWED_DIRS", None)
+        existing["env"] = env_overrides
+
     cfg = existing
     cfg.update(
         {
@@ -767,6 +815,20 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     print()
     problems = 0
+    for dropped in [o for o in previous["orchestrators"] if o not in orchestrators]:
+        # A re-run that deselects an orchestrator used to leave its registration, links and
+        # instruction block behind, untracked and impossible to uninstall.
+        say(f"{ORCHESTRATOR_LABELS[dropped]} was deselected; removing its registration")
+        try:
+            if dropped == "opencode":
+                say(unregister_opencode())
+            elif dropped == "claude_code":
+                say(unregister_claude())
+            else:
+                say(unregister_antigravity())
+        except SystemExit as exc:
+            warn(str(exc))
+            problems += 1
     if "opencode" in orchestrators:
         say(register_opencode())
     if "claude_code" in orchestrators:
@@ -787,6 +849,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         say(message)
         if message.startswith(("linked", "skill already")):
             links.append(str(target))
+    for stale in [link for link in previous["skill_links"] if link not in links]:
+        say(unlink_skill(Path(stale)))
     cfg["skill_links"] = links
     agent_links: list[str] = []
     for target, src in agent_targets(orchestrators):
@@ -794,6 +858,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         say(message)
         if message.startswith(("linked", "delegating subagent already")):
             agent_links.append(str(target))
+    for stale in [link for link in previous["agent_links"] if link not in agent_links]:
+        say(unlink_agent(Path(stale)))
     cfg["agent_links"] = agent_links
 
     saved_profiles = [d for d in existing.get("claude_profiles", []) if isinstance(d, str)]
@@ -821,7 +887,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
             path = Path(os.path.expanduser(profile)) / "CLAUDE.md"
             say(write_instructions(path, INSTRUCTIONS_WITH_SUBAGENT))
             instruction_files.append(str(path))
-    cfg["instruction_files"] = instruction_files or cfg.get("instruction_files", [])
+        for stale in [path for path in previous["instruction_files"] if path not in instruction_files]:
+            say(remove_instructions(Path(stale)))
+        cfg["instruction_files"] = instruction_files
+    else:
+        cfg["instruction_files"] = previous["instruction_files"]
 
     say(f"configuration saved to {save_config(cfg)}")
 
@@ -833,7 +903,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print("     delegation and returns a summary, keeping the main thread's context clean.")
     print("  4. `intercom doctor` repeats these checks from the shell at any time.")
     if not launcher_on_path():
-        print(f"  4. Put {bin_dir()} on PATH so `intercom` resolves in new shells.")
+        print(f"  5. Put {bin_dir()} on PATH so `intercom` resolves in new shells.")
     return 1 if problems else 0
 
 
@@ -968,6 +1038,54 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_runs(args: argparse.Namespace) -> int:
+    server = _server_module()
+    records = server.read_journal()
+    if args.harness:
+        records = [r for r in records if r.get("harness") == args.harness]
+    if args.status:
+        records = [r for r in records if r.get("status") == args.status]
+    print(server._format_runs(records[: args.limit]))
+    if not records:
+        print(f"(journal: {server.journal_path()})")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    server = _server_module()
+    entry, report, patch = server.read_run(args.run_id)
+    if entry is None and not report and not patch:
+        raise SystemExit(f"error: no run {args.run_id} in {server.journal_path()}; list them with `intercom runs`")
+    if args.patch:
+        if not patch:
+            raise SystemExit(f"error: run {args.run_id} stored no patch (patches are kept for isolate=true runs)")
+        print(patch, end="" if patch.endswith("\n") else "\n")
+    else:
+        print(report or "(the stored report for this run is gone)")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    """Apply the patch an isolate=true delegation produced to a real working tree."""
+    server = _server_module()
+    _, _, patch = server.read_run(args.run_id)
+    patch_file = server.runs_dir() / f"{args.run_id}.patch"
+    if not patch or not patch_file.is_file():
+        raise SystemExit(f"error: run {args.run_id} stored no patch (patches are kept for isolate=true runs)")
+    repo = Path(os.path.expanduser(args.repo)).resolve()
+    check = subprocess.run(["git", "-C", str(repo), "apply", "--check", str(patch_file)], capture_output=True, text=True)
+    if check.returncode != 0:
+        raise SystemExit(
+            f"error: the patch does not apply cleanly to {repo}:\n{(check.stderr or check.stdout).strip()}\n"
+            f"inspect it with `intercom show {args.run_id} --patch`"
+        )
+    result = subprocess.run(["git", "-C", str(repo), "apply", str(patch_file)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"error: `git apply` failed:\n{(result.stderr or result.stdout).strip()}")
+    say(f"applied run {args.run_id} to {repo}; review with `git -C {repo} diff`")
+    return 0
+
+
 def cmd_config(_: argparse.Namespace) -> int:
     cfg = load_config()
     print(f"config file:       {config_path()}{'' if config_path().exists() else '  (not written yet)'}")
@@ -975,6 +1093,12 @@ def cmd_config(_: argparse.Namespace) -> int:
     print(f"launcher:          {launcher_path()}")
     print(f"opencode config:   {opencode_config_path()}")
     print(f"skill source:      {SKILL_SRC}")
+    try:
+        server = _server_module()
+        print(f"run journal:       {server.journal_path()}")
+        print(f"allowed dirs:      {', '.join(str(d) for d in server.allowed_dirs()) or '(anywhere)'}")
+    except SystemExit as exc:  # the venv is not usable; paths are still worth printing
+        warn(str(exc))
     print()
     print(json.dumps(cfg, indent=2))
     return 0
@@ -990,6 +1114,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--flags", action="append", metavar="HARNESS=FLAGS", help='default flags, e.g. --flags claude_code="--model sonnet"')
     setup.add_argument("--claude-config-dir", action="append", metavar="DIR",
                        help="also register for a Claude profile at this CLAUDE_CONFIG_DIR (repeatable)")
+    setup.add_argument("--allowed-dir", action="append", metavar="DIR",
+                       help="confine delegation to this directory tree (repeatable; pass none to clear)")
     setup.add_argument("--no-instructions", action="store_true",
                        help="do not add the intercom delegation guidance to CLAUDE.md/AGENTS.md/GEMINI.md")
     setup.add_argument("--max-depth", type=int, default=None, help="delegation depth allowed below the server (default 1)")
@@ -1001,6 +1127,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("test", help="run the test suite").set_defaults(func=cmd_test)
     sub.add_parser("update", help="pull the latest version").set_defaults(func=cmd_update)
     sub.add_parser("config", help="print configuration and paths").set_defaults(func=cmd_config)
+
+    runs = sub.add_parser("runs", help="list recent delegations from the run journal")
+    runs.add_argument("--limit", type=int, default=20, help="how many runs to show (default 20)")
+    runs.add_argument("--harness", choices=HARNESS_KEYS, help="only runs on this harness")
+    runs.add_argument("--status", choices=("success", "failure", "timeout"), help="only runs with this status")
+    runs.set_defaults(func=cmd_runs)
+
+    show = sub.add_parser("show", help="print the stored report (or patch) of one run")
+    show.add_argument("run_id")
+    show.add_argument("--patch", action="store_true", help="print the run's patch instead of its report")
+    show.set_defaults(func=cmd_show)
+
+    apply_cmd = sub.add_parser("apply", help="apply an isolated run's patch to a working tree")
+    apply_cmd.add_argument("run_id")
+    apply_cmd.add_argument("--repo", default=".", help="repository to apply into (default: current directory)")
+    apply_cmd.set_defaults(func=cmd_apply)
     sub.add_parser("install-launcher", help=argparse.SUPPRESS).set_defaults(func=cmd_install_launcher)
 
     uninstall = sub.add_parser("uninstall", help="remove registrations, skill links, launcher and config")
