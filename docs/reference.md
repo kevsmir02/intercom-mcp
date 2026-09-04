@@ -37,6 +37,33 @@ Each report also carries `Conversation ID`, `Run ID` and `Harness stats` (status
 cost, model). `check_<harness>_health` returns `[HEALTH: READY]`, `[HEALTH: DEGRADED]` or
 `[HEALTH: UNAVAILABLE]`.
 
+## Structured results
+
+Every tool result carries the readable report **and** the same run stated in fields, so an
+orchestrator can branch on data instead of matching on a text prefix. The report is unchanged --
+it is still the text content of the same result -- so nothing that reads text needs to change, and
+a client that does not understand structured content simply ignores it.
+
+`delegate_to_<harness>` and `consult_<harness>` publish `DelegationResult`:
+
+| Field | Meaning |
+| --- | --- |
+| `outcome` | `success`, `failure`, `timeout`, `invalid_argument`, `busy` or `unavailable` |
+| `harness`, `mode` | which harness, and `delegate` or `consult` |
+| `run_id`, `conversation_id` | pass to `get_run`, and back as `conversation_id` |
+| `files_changed`, `commits`, `committed` | what THIS run changed; `committed` means the work is in a commit, not the tree |
+| `isolated`, `patch_path` | whether it ran in a worktree, and where its patch is |
+| `duration_seconds`, `exit_code`, `tokens_in`, `tokens_out`, `cost_usd`, `model` | |
+| `cause` | probable cause, when the run did not succeed |
+
+`check_<harness>_health` publishes `HealthResult` (`outcome`, `binary`, `version`,
+`verified_version`, `authenticated`, `problems`) and `consult_many` publishes `PanelResult`
+(`asked`, `answered`, `abandoned`, and an `answers` entry per harness with its own `run_id` and
+`conversation_id`).
+
+Structured output arrived mid-1.x in the MCP SDK. On an older SDK the tools return plain reports
+instead, which is what every consumer already branches on.
+
 ## Change attribution
 
 The working tree is snapshotted before the harness starts -- `HEAD`, every dirty path, and each of

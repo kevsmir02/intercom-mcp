@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -74,7 +75,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable
 
+from pydantic import BaseModel
 from pydantic import Field
+from pydantic import Field as PField
 
 try:  # mcp >= 2.0 (FastMCP was renamed to MCPServer)
     from mcp.server.mcpserver import MCPServer as _ServerImpl
@@ -82,6 +85,11 @@ try:  # mcp >= 2.0 (FastMCP was renamed to MCPServer)
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _ServerImpl
     from mcp.server.fastmcp import Context as _Context
+
+try:  # structured tool results; absent on older SDKs, where reports stay text-only
+    from mcp.types import CallToolResult, TextContent
+except ImportError:  # pragma: no cover - very old SDK
+    CallToolResult = TextContent = None  # type: ignore[assignment,misc]
 
 __version__ = "0.1.0"  # 0.x: the tool surface and the harness adapters are still moving
 SERVER_NAME = "intercom"
@@ -2212,7 +2220,7 @@ async def delegate(
         return report
 
 
-async def health(harness: Harness) -> str:
+async def health(harness: Harness, record: dict[str, Any] | None = None) -> str:
     requested = harness.binary_setting()
     binary = harness.resolve_binary()
     config_lines = [
@@ -2229,6 +2237,8 @@ async def health(harness: Harness) -> str:
         f"HOME: {os.environ.get('HOME', '(unset)')}",
     ]
     if not binary:
+        if record is not None:
+            record.update({"outcome": "unavailable", "harness": harness.key, "problems": ["binary not found"]})
         return _render(
             "[HEALTH: UNAVAILABLE]",
             f"{harness.label} not found",
@@ -2265,12 +2275,13 @@ async def health(harness: Harness) -> str:
         problems.append(f"`{harness.binary} --version` failed")
 
     extra_section = ""
+    authed = False
     if auth.timed_out:
         auth_text = f"UNKNOWN: `{harness.binary} {' '.join(harness.auth_probe)}` timed out after {HEALTH_PROBE_TIMEOUT}s"
         problems.append("authentication probe timed out")
     else:
-        ok, auth_text, extra_section = harness.parse_auth(auth)
-        if not ok:
+        authed, auth_text, extra_section = harness.parse_auth(auth)
+        if not authed:
             problems.append("authentication probe failed")
 
     installed = _version_number(version_text)
@@ -2289,6 +2300,18 @@ async def health(harness: Harness) -> str:
         cred_text = f"absent ({cred}); informational only, the probe above is authoritative"
 
     status = "[HEALTH: READY]" if not problems else "[HEALTH: DEGRADED]"
+    if record is not None:
+        record.update(
+            {
+                "outcome": "ready" if not problems else "degraded",
+                "harness": harness.key,
+                "binary": binary,
+                "version": installed or version_text,
+                "verified_version": harness.verified_version,
+                "authenticated": authed,
+                "problems": problems,
+            }
+        )
     headline = (
         f"{harness.label} is ready for delegation"
         if not problems
@@ -2400,6 +2423,11 @@ IncludeDiffArg = Annotated[
 ]
 
 
+def _annotate(fn: Callable[..., Any], model: type[BaseModel]) -> None:
+    """Declare the tool's return type: a structured result where the SDK supports one, else text."""
+    fn.__annotations__["return"] = Annotated[CallToolResult, model] if STRUCTURED_RESULTS else str
+
+
 def _progress_sink(ctx: "_Context | None") -> ProgressFn | None:
     if ctx is None:
         return None
@@ -2408,6 +2436,141 @@ def _progress_sink(ctx: "_Context | None") -> ProgressFn | None:
         await ctx.report_progress(value, total, message)
 
     return progress
+
+
+class DelegationResult(BaseModel):
+    """What a delegation or consultation did, for a caller that would rather not parse prose.
+
+    The readable report is still the text content of the same tool result; this is the same
+    run stated in fields, so an orchestrator can branch without matching on a prefix.
+    """
+
+    outcome: str = PField(description="success, failure, timeout, invalid_argument, busy or unavailable")
+    harness: str
+    mode: str = PField(description="delegate or consult")
+    working_dir: str
+    run_id: str | None = PField(default=None, description="pass to get_run for the full stored report")
+    conversation_id: str | None = PField(default=None, description="pass back to continue this session")
+    duration_seconds: float | None = None
+    exit_code: int | None = None
+    files_changed: list[str] = PField(default_factory=list, description="paths THIS run changed")
+    commits: list[str] = PField(default_factory=list, description="commits the harness made, if any")
+    committed: bool = PField(default=False, description="true when the work is in a commit, not the tree")
+    isolated: bool = PField(default=False, description="ran in a throwaway git worktree")
+    patch_path: str | None = PField(default=None, description="patch to apply, for an isolated run")
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
+    model: str | None = None
+    cause: str | None = PField(default=None, description="probable cause, when the run did not succeed")
+
+
+class PanelAnswer(BaseModel):
+    harness: str
+    status: str = PField(description="answered, failed, or gave up")
+    run_id: str | None = None
+    conversation_id: str | None = PField(default=None, description="pass back to press this harness")
+    duration_seconds: float | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
+
+
+class PanelResult(BaseModel):
+    outcome: str
+    panel_run_id: str
+    working_dir: str
+    asked: int
+    answered: int
+    abandoned: list[str] = PField(default_factory=list)
+    answers: list[PanelAnswer] = PField(default_factory=list)
+
+
+class HealthResult(BaseModel):
+    outcome: str = PField(description="ready, degraded or unavailable")
+    harness: str
+    binary: str | None = None
+    version: str | None = None
+    verified_version: str | None = None
+    authenticated: bool = False
+    problems: list[str] = PField(default_factory=list)
+
+
+def structured_results_supported() -> bool:
+    """Can this SDK carry a readable text block AND structured fields in one tool result?
+
+    Structured output arrived mid-1.x. Where it is missing the tools return plain reports,
+    which is what every consumer already branches on.
+    """
+    if CallToolResult is None or TextContent is None:
+        return False
+    try:
+        return "structured_output" in inspect.signature(mcp.tool).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+
+
+def _as_result(report: str, structured: BaseModel) -> Any:
+    """One tool result carrying the human-readable report and the machine-readable facts."""
+    return CallToolResult(
+        content=[TextContent(type="text", text=report)],
+        structured_content=structured.model_dump(mode="json"),
+    )
+
+
+_OUTCOME_BY_PREFIX = {
+    "[SUCCESS]": "success",
+    "[TIMEOUT_ERROR]": "timeout",
+    "[INVALID_ARGUMENT]": "invalid_argument",
+    "[HEALTH: READY]": "ready",
+    "[HEALTH: DEGRADED]": "degraded",
+    "[HEALTH: UNAVAILABLE]": "unavailable",
+}
+
+
+def outcome_of(report: str) -> str:
+    """The outcome word for a report, for the paths that fail before a run is journalled."""
+    head = report.split("\n", 1)[0]
+    for prefix, outcome in _OUTCOME_BY_PREFIX.items():
+        if head.startswith(prefix):
+            return outcome
+    if head.startswith("[ROADBLOCK / FAILURE]"):
+        if "working tree busy" in head:
+            return "busy"
+        if "not found" in head or "could not start" in head:
+            return "unavailable"
+        return "failure"
+    return "failure"
+
+
+def _delegation_structured(
+    harness: Harness, report: str, entry: dict[str, Any], working_dir: str, read_only: bool
+) -> DelegationResult:
+    outcome = entry.get("status") or outcome_of(report)
+    run_id = entry.get("run_id")
+    return DelegationResult(
+        outcome=outcome,
+        harness=harness.key,
+        mode="consult" if read_only else "delegate",
+        working_dir=str(entry.get("working_dir") or working_dir),
+        run_id=run_id,
+        conversation_id=entry.get("conversation_id"),
+        duration_seconds=entry.get("duration_seconds"),
+        exit_code=entry.get("exit_code"),
+        files_changed=list(entry.get("files_changed") or []),
+        commits=list(entry.get("commits") or []),
+        committed=bool(entry.get("commits")),
+        isolated=bool(entry.get("isolated")),
+        patch_path=str(runs_dir() / f"{run_id}.patch") if run_id and entry.get("isolated") else None,
+        tokens_in=entry.get("tokens_in"),
+        tokens_out=entry.get("tokens_out"),
+        cost_usd=entry.get("cost_usd"),
+        model=entry.get("model"),
+        cause=entry.get("cause"),
+    )
+
+
+STRUCTURED_RESULTS = structured_results_supported()
 
 
 def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..., Any]]:
@@ -2421,8 +2584,9 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
         include_diff: IncludeDiffArg = False,
         isolate: IsolateArg = False,
         ctx: _Context = None,  # injected by the SDK; excluded from the tool's input schema
-    ) -> str:
-        return await delegate(
+    ):
+        entry: dict[str, Any] = {}
+        report = await delegate(
             harness,
             prompt,
             working_dir,
@@ -2433,7 +2597,11 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
             include_diff,
             _progress_sink(ctx),
             isolate=isolate,
+            record=entry,
         )
+        if not STRUCTURED_RESULTS:
+            return report
+        return _as_result(report, _delegation_structured(harness, report, entry, working_dir, False))
 
     async def consult_tool(
         prompt: PromptArg,
@@ -2442,8 +2610,9 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
         timeout_seconds: TimeoutArg = DEFAULT_TIMEOUT_SECONDS,
         conversation_id: ConversationArg = None,
         ctx: _Context = None,
-    ) -> str:
-        return await delegate(
+    ):
+        entry: dict[str, Any] = {}
+        report = await delegate(
             harness,
             prompt,
             working_dir,
@@ -2454,10 +2623,25 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
             False,
             _progress_sink(ctx),
             read_only=True,
+            record=entry,
         )
+        if not STRUCTURED_RESULTS:
+            return report
+        return _as_result(report, _delegation_structured(harness, report, entry, working_dir, True))
 
-    async def health_tool() -> str:
-        return await health(harness)
+    async def health_tool():
+        entry: dict[str, Any] = {}
+        report = await health(harness, record=entry)
+        if not STRUCTURED_RESULTS:
+            return report
+        entry.setdefault("outcome", outcome_of(report))
+        entry.setdefault("harness", harness.key)
+        return _as_result(report, HealthResult(**entry))
+
+    # The SDK reads __annotations__, so the published output schema follows the SDK's support.
+    _annotate(delegate_tool, DelegationResult)
+    _annotate(consult_tool, DelegationResult)
+    _annotate(health_tool, HealthResult)
 
     delegate_tool.__name__ = f"delegate_to_{harness.key}"
     delegate_tool.__qualname__ = delegate_tool.__name__
@@ -2529,6 +2713,22 @@ def _panel_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _panel_problem(report: str, working_dir: str, keys: list[str]) -> Any:
+    """An early panel refusal, in whichever shape this SDK's tool results take."""
+    if not STRUCTURED_RESULTS:
+        return report
+    return _as_result(
+        report,
+        PanelResult(
+            outcome=outcome_of(report),
+            panel_run_id="",
+            working_dir=str(working_dir),
+            asked=len(keys),
+            answered=0,
+        ),
+    )
+
+
 async def consult_many(
     prompt: Annotated[
         str,
@@ -2562,16 +2762,21 @@ async def consult_many(
     keys = list(REGISTERED_TOOLS) if not harnesses else [str(k).strip() for k in harnesses if str(k).strip()]
     unknown = [k for k in keys if k not in REGISTERED_TOOLS]
     if unknown:
-        return (
+        return _panel_problem(
             f"[INVALID_ARGUMENT] unknown or disabled harness(es) {unknown}; "
-            f"available: {', '.join(REGISTERED_TOOLS)}."
+            f"available: {', '.join(REGISTERED_TOOLS)}.",
+            working_dir,
+            keys,
         )
     keys = list(dict.fromkeys(keys))
-    if not keys:
-        return "[INVALID_ARGUMENT] no harness is enabled."
     ids = conversation_ids or {}
-    if not isinstance(ids, dict):
-        return "[INVALID_ARGUMENT] conversation_ids must be an object mapping harness key to conversation id."
+    problem = ""
+    if not keys:
+        problem = "[INVALID_ARGUMENT] no harness is enabled."
+    elif not isinstance(ids, dict):
+        problem = "[INVALID_ARGUMENT] conversation_ids must be an object mapping harness key to conversation id."
+    if problem:
+        return _panel_problem(problem, working_dir, keys)
 
     started = time.monotonic()
     finished: dict[str, str] = {}
@@ -2742,8 +2947,7 @@ async def consult_many(
             sections,
         )
     )
-    record_run(
-        {
+    panel_record = {
             "run_id": panel_id,
             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "mode": "consult_many",
@@ -2761,10 +2965,34 @@ async def consult_many(
             "cost_usd": sum(row.get("cost_usd") or 0.0 for row in rows) or None,
             "files_changed": [],
             "prompt_chars": len(prompt),
-        },
+    }
+    record_run(panel_record, report)
+    if not STRUCTURED_RESULTS:
+        return report
+    return _as_result(
         report,
+        PanelResult(
+            outcome="success" if answered else "failure",
+            panel_run_id=panel_id,
+            working_dir=str(working_dir),
+            asked=len(keys),
+            answered=answered,
+            abandoned=abandoned,
+            answers=[
+                PanelAnswer(
+                    harness=row["harness"],
+                    status=row["status"],
+                    run_id=row.get("run_id"),
+                    conversation_id=row.get("conversation_id"),
+                    duration_seconds=row.get("duration_seconds"),
+                    tokens_in=row.get("tokens_in"),
+                    tokens_out=row.get("tokens_out"),
+                    cost_usd=row.get("cost_usd"),
+                )
+                for row in rows
+            ],
+        ),
     )
-    return report
 
 
 def _median(values: list[float]) -> float:
@@ -2915,6 +3143,7 @@ mcp.tool(
         "remaining budget, or to find the Run ID of an earlier delegation."
     ),
 )(list_runs)
+_annotate(consult_many, PanelResult)
 mcp.tool(
     name="consult_many",
     description=(

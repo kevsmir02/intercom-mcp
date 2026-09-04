@@ -270,6 +270,11 @@ def result_text(result) -> str:
     return "\n".join(getattr(c, "text", "") for c in result.content if getattr(c, "type", "") == "text")
 
 
+def structured(result) -> dict:
+    """mcp 2.x exposes structured_content, the wire name is structuredContent."""
+    return getattr(result, "structured_content", None) or getattr(result, "structuredContent", None) or {}
+
+
 def input_schema(tool) -> dict:
     """mcp 2.x exposes Tool.input_schema, mcp 1.x Tool.inputSchema."""
     schema = getattr(tool, "input_schema", None)
@@ -337,9 +342,12 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
                 yield session
 
     async def call(self, session: ClientSession, tool: str, **arguments) -> str:
+        return result_text(await self.call_raw(session, tool, **arguments))
+
+    async def call_raw(self, session: ClientSession, tool: str, **arguments):
         if tool.startswith(("delegate_to_", "consult_")):
             arguments.setdefault("working_dir", str(self.workdir))
-        return result_text(await session.call_tool(tool, arguments))
+        return await session.call_tool(tool, arguments)
 
     def init_repo(self, commit: bool = False) -> None:
         if not shutil.which("git"):
@@ -992,6 +1000,105 @@ class TestStreamingProgress(BridgeTestCase):
         self.assertEqual(seen[5], "running Bash", "a rate-limit event must not clobber the tool")
         self.assertEqual(seen[6], "Bash finished")
         self.assertEqual(seen[7], "finishing")
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestStructuredResults(BridgeTestCase):
+    """Every tool result carries the readable report AND the same run stated in fields."""
+
+    async def test_a_successful_delegation_is_readable_and_structured(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session() as session:
+            result = await self.call_raw(session, "delegate_to_claude_code", prompt="__WRITE__:made.txt")
+        text, data = result_text(result), structured(result)
+        self.assertTrue(text.startswith("[SUCCESS]"), "the text contract must survive")
+        self.assertEqual(data["outcome"], "success")
+        self.assertEqual(data["harness"], "claude_code")
+        self.assertEqual(data["mode"], "delegate")
+        self.assertEqual(data["conversation_id"], "claude-sess-456")
+        self.assertEqual(data["files_changed"], ["made.txt"])
+        self.assertFalse(data["committed"])
+        self.assertEqual(data["cost_usd"], 0.0123)
+        self.assertIn(data["run_id"], text)  # the same run id the report prints
+
+    async def test_a_failure_is_structured_with_its_cause(self) -> None:
+        async with self.session() as session:
+            result = await self.call_raw(session, "delegate_to_antigravity", prompt="run tests __FAIL__")
+        data = structured(result)
+        self.assertTrue(result_text(result).startswith("[ROADBLOCK / FAILURE]"))
+        self.assertEqual(data["outcome"], "failure")
+        self.assertEqual(data["exit_code"], 3)
+        self.assertIn("Task-level failure", data["cause"])
+
+    async def test_early_refusals_are_structured_too(self) -> None:
+        async with self.session() as session:
+            bad_dir = await self.call_raw(session, "delegate_to_antigravity", prompt="x",
+                                          working_dir="/nope/does/not/exist")
+            missing = await self.call_raw(session, "delegate_to_antigravity", prompt="x")
+        self.assertEqual(structured(bad_dir)["outcome"], "invalid_argument")
+        self.assertEqual(structured(bad_dir)["harness"], "antigravity")
+        self.assertEqual(structured(missing)["outcome"], "success")  # sanity: the good path still works
+
+    async def test_a_busy_tree_is_structured_as_busy(self) -> None:
+        async with self.session(FAKE_SLEEP="2.0") as session:
+            slow = asyncio.ensure_future(self.call(session, "delegate_to_antigravity", prompt="__SLOW__ one"))
+            await asyncio.sleep(0.7)
+            blocked = await self.call_raw(session, "delegate_to_claude_code", prompt="two")
+            await slow
+        self.assertEqual(structured(blocked)["outcome"], "busy")
+
+    async def test_an_isolated_run_reports_where_its_patch_is(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session() as session:
+            result = await self.call_raw(session, "delegate_to_antigravity",
+                                         prompt="__WRITE__:iso.txt", isolate=True)
+        data = structured(result)
+        self.assertTrue(data["isolated"])
+        self.assertTrue(data["patch_path"].endswith(f"{data['run_id']}.patch"))
+        self.assertIn("iso.txt", data["files_changed"])
+
+    async def test_a_consultation_is_structured_as_a_consultation(self) -> None:
+        async with self.session() as session:
+            result = await self.call_raw(session, "consult_opencode", prompt="what does this do?")
+        data = structured(result)
+        self.assertEqual(data["mode"], "consult")
+        self.assertEqual(data["outcome"], "success")
+        self.assertEqual(data["files_changed"], [])
+
+    async def test_health_is_structured(self) -> None:
+        async with self.session() as session:
+            ready = structured(await self.call_raw(session, "check_claude_code_health"))
+            async with self.session(FAKE_AUTH_FAIL="1") as bad_session:
+                degraded = structured(await self.call_raw(bad_session, "check_claude_code_health"))
+        self.assertEqual(ready["outcome"], "ready")
+        self.assertTrue(ready["authenticated"])
+        self.assertEqual(ready["verified_version"], "2.1.259")
+        self.assertEqual(degraded["outcome"], "degraded")
+        self.assertFalse(degraded["authenticated"])
+        self.assertTrue(degraded["problems"])
+
+    async def test_a_panel_is_structured_per_answer(self) -> None:
+        async with self.session() as session:
+            result = await self.call_raw(session, "consult_many", prompt="review",
+                                         harnesses=["antigravity", "pi"])
+        data = structured(result)
+        self.assertEqual((data["asked"], data["answered"]), (2, 2))
+        self.assertEqual([a["harness"] for a in data["answers"]], ["antigravity", "pi"])
+        self.assertEqual(data["answers"][0]["conversation_id"], "agy-conv-123")
+        self.assertTrue(data["panel_run_id"])
+
+    async def test_every_tool_publishes_an_output_schema(self) -> None:
+        async with self.session() as session:
+            tools = {t.name: t for t in (await session.list_tools()).tools}
+        for name, title in (
+            ("delegate_to_antigravity", "DelegationResult"),
+            ("consult_antigravity", "DelegationResult"),
+            ("check_antigravity_health", "HealthResult"),
+            ("consult_many", "PanelResult"),
+        ):
+            schema = getattr(tools[name], "output_schema", None) or getattr(tools[name], "outputSchema", None)
+            self.assertIsNotNone(schema, name)
+            self.assertEqual(schema.get("title"), title, name)
 
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")

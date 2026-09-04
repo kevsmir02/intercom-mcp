@@ -44,7 +44,10 @@ tool call, and nobody has to be told the plan twice.
    throwaway git worktree instead of the real tree -- use it when the tree is dirty, or
    to race the same brief on two harnesses at once. Only one non-isolated delegation
    runs per working tree; a second returns "working tree busy".
-4. **Branch on the prefix** of the report:
+4. **Branch on the result.** Each result carries structured fields as well as the report --
+   `outcome` (`success`, `failure`, `timeout`, `invalid_argument`, `busy`, `unavailable`),
+   `files_changed`, `committed`, `conversation_id`, `run_id`, `cost_usd`. Use them if your
+   client surfaces them; otherwise branch on the report's prefix, which means the same thing:
    - `[SUCCESS]`: review (step 5).
    - `[ROADBLOCK / FAILURE]`: read "Probable cause" and the diagnostics. An
      environment cause goes back to step 1 (or to another harness), a brief defect

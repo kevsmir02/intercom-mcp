@@ -28,6 +28,8 @@ What the report tells you:
   Pass `isolate: true` to run in a throwaway `git worktree` instead, which is also how you race the
   same brief on two harnesses at once and keep the better patch.
 - **a Run ID.** `get_run` returns the full report later, so the conclusion can stay short now.
+- **structured fields as well as prose.** The same result carries `outcome`, `files_changed`,
+  `committed`, `conversation_id` and cost, so a caller can branch on data rather than on a prefix.
 
 ## Install
 
