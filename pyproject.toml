@@ -6,8 +6,10 @@
 # and for the dev tooling below, not to publish a wheel.
 [project]
 name = "intercom-mcp"
-version = "2.1.0"
+version = "0.1.0"
 description = "MCP server that delegates coding tasks to headless harnesses (Antigravity, Claude Code, OpenCode, pi) and returns reviewable reports"
+# 0.x on purpose: nothing here is stable yet. The tool surface still grows, report formats
+# still change, and each harness adapter tracks a CLI whose flags move under it.
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

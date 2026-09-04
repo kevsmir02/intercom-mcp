@@ -83,7 +83,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _ServerImpl
     from mcp.server.fastmcp import Context as _Context
 
-__version__ = "2.1.0"
+__version__ = "0.1.0"  # 0.x: the tool surface and the harness adapters are still moving
 SERVER_NAME = "intercom"
 
 log = logging.getLogger(SERVER_NAME)

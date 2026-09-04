@@ -10,7 +10,7 @@ How to install, update, and remove intercom. For the one-line install, see the [
 | `curl ... \| bash -s -- --yes` | Setup with detected defaults, no questions |
 | `INTERCOM_HOME=/opt/intercom curl ... \| bash` | Install elsewhere |
 | `INTERCOM_BIN_DIR=/usr/local/bin curl ... \| bash` | Put the launcher elsewhere |
-| `INTERCOM_REF=v1.0.0 curl ... \| bash` | Install a branch or tag |
+| `INTERCOM_REF=some-branch curl ... \| bash` | Install a branch or tag (there are no tags yet; see Versioning) |
 
 If `~/.local/bin` is not on your `PATH`, the installer says so; add
 `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
@@ -42,6 +42,22 @@ there too.
 Re-running setup is also how you *undo* a choice: deselecting an orchestrator removes its
 registration, its subagent and skill links, and the guidance block it added to your instruction
 file.
+
+## Versioning
+
+There are no releases. `server.py` reports `0.1.0`, and it will stay on `0.x` until the tool surface
+stops moving: tools are still being added, report formats still change, and every harness adapter
+tracks a CLI whose flags shift underneath it.
+
+Practically, that means `INTERCOM_REF` can only name a **branch** (`install.sh` passes it to
+`git clone --branch`, which does not accept a commit sha), and the supported way to move forward is
+`intercom update`, which fast-forwards `main`. To go back to a known-good state, use the checkout
+directly:
+
+```bash
+git -C ~/.local/share/intercom log --oneline -10
+git -C ~/.local/share/intercom checkout <sha>
+```
 
 ## Updating
 
