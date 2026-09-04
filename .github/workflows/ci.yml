@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Configure git for the hermetic repo fixtures
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          git config --global init.defaultBranch main
+      # Both suites are hermetic: they run against fake harness binaries and a
+      # throwaway HOME, so no harness CLI, credential or quota is required.
+      - name: Bridge tests
+        run: python test_bridge.py
+      - name: CLI tests
+        run: python test_cli.py
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the venv and launcher the way install.sh does
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -q --upgrade pip
+          .venv/bin/python -m pip install -q -r requirements.txt
+          INTERCOM_BIN_DIR="$RUNNER_TEMP/bin" .venv/bin/python intercom.py install-launcher
+          test -x "$RUNNER_TEMP/bin/intercom"
+      - name: The CLI runs and reports its paths
+        run: |
+          INTERCOM_BIN_DIR="$RUNNER_TEMP/bin" "$RUNNER_TEMP/bin/intercom" config
+          INTERCOM_BIN_DIR="$RUNNER_TEMP/bin" "$RUNNER_TEMP/bin/intercom" runs
+      - name: With no harness CLI installed, setup fails with a clear message
+        run: |
+          set +e
+          out=$(INTERCOM_BIN_DIR="$RUNNER_TEMP/bin" "$RUNNER_TEMP/bin/intercom" setup --yes 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" -ne 0
+          echo "$out" | grep -q "no harness selected"
+      - name: The installer script is valid bash
+        run: bash -n install.sh
