@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "_comment": "Template for a MANUAL OpenCode registration. Replace INTERCOM_DIR with the absolute path where intercom is installed (the installer uses ~/.local/share/intercom). Prefer `intercom setup`, which writes this for you with the correct per-machine paths. This direct form needs no launcher; the launcher form is [\"<INTERCOM_BIN_DIR>/intercom\", \"serve\"].",
+  "_comment": "Template for a MANUAL OpenCode registration. Replace INTERCOM_DIR with the absolute path where intercom is installed (the installer uses ~/.local/share/intercom). Prefer `intercom setup`, which writes this for you with the correct per-machine paths. This direct form needs no launcher; the launcher form is [\"<INTERCOM_BIN_DIR>/intercom\", \"serve\"]. Every value below is a default -- delete any line you do not want to override.",
   "mcp": {
     "intercom": {
       "type": "local",
@@ -16,11 +16,20 @@
         "CLAUDE_BIN": "claude",
         "CLAUDE_AUTO_APPROVE_FLAGS": "--dangerously-skip-permissions",
         "CLAUDE_DEFAULT_FLAGS": "",
+        "OPENCODE_BIN": "opencode",
+        "OPENCODE_AUTO_APPROVE_FLAGS": "--auto",
+        "OPENCODE_DEFAULT_FLAGS": "",
+        "PI_BIN": "pi",
+        "PI_AUTO_APPROVE_FLAGS": "--approve",
+        "PI_DEFAULT_FLAGS": "",
         "INTERCOM_HARNESSES": "",
+        "INTERCOM_STATE_DIR": "",
+        "BRIDGE_ALLOWED_DIRS": "",
         "BRIDGE_MAX_DEPTH": "1",
         "BRIDGE_MAX_OUTPUT_CHARS": "60000",
         "BRIDGE_KILL_GRACE_SECONDS": "5",
         "BRIDGE_HEARTBEAT_SECONDS": "15",
+        "BRIDGE_KEEP_RUNS": "200",
         "BRIDGE_LOG_LEVEL": "INFO"
       },
       "timeout": 10800000
