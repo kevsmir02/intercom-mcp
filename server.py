@@ -1883,7 +1883,14 @@ async def delegate(
     *,
     read_only: bool = False,
     isolate: bool = False,
+    record: dict[str, Any] | None = None,
 ) -> str:
+    """Run one headless task and return its report.
+
+    `record`, when given, is filled with this run's journal entry plus the harness's response
+    text, so an aggregating caller (consult_many) gets structured results without parsing the
+    rendered report. It stays empty when the call fails before the harness starts.
+    """
     cwd, error = validate_working_dir(working_dir)
     if error:
         return f"[INVALID_ARGUMENT] {error}"
@@ -1941,7 +1948,9 @@ async def delegate(
     started_at = time.time()
 
     async with contextlib.AsyncExitStack() as stack:
-        if not isolate:
+        # Only work that writes needs the tree: a read-only consultation must neither wait for a
+        # delegation nor block one, or a panel of consults would run one at a time.
+        if not isolate and not read_only:
             try:
                 await stack.enter_async_context(working_tree_lock(cwd, holder))
             except TreeBusy as exc:
@@ -2057,30 +2066,30 @@ async def delegate(
                 status = "failure"
 
         report = redact(report)
-        record_run(
-            {
-                "run_id": run_id,
-                "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at)),
-                "mode": "consult" if read_only else "delegate",
-                "harness": harness.key,
-                "working_dir": str(cwd),
-                "isolated": worktree is not None,
-                "status": status,
-                "exit_code": result.returncode,
-                "duration_seconds": round(result.duration, 2),
-                "timeout_seconds": timeout_seconds,
-                "conversation_id": outcome.conversation_id,
-                "model": outcome.model,
-                "tokens_in": outcome.tokens_in,
-                "tokens_out": outcome.tokens_out,
-                "cost_usd": outcome.cost_usd,
-                "files_changed": changes.touched(),
-                "commits": changes.commits,
-                "prompt_chars": len(prompt),
-            },
-            report,
-            patch,
-        )
+        entry = {
+            "run_id": run_id,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at)),
+            "mode": "consult" if read_only else "delegate",
+            "harness": harness.key,
+            "working_dir": str(cwd),
+            "isolated": worktree is not None,
+            "status": status,
+            "exit_code": result.returncode,
+            "duration_seconds": round(result.duration, 2),
+            "timeout_seconds": timeout_seconds,
+            "conversation_id": outcome.conversation_id,
+            "model": outcome.model,
+            "tokens_in": outcome.tokens_in,
+            "tokens_out": outcome.tokens_out,
+            "cost_usd": outcome.cost_usd,
+            "files_changed": changes.touched(),
+            "commits": changes.commits,
+            "prompt_chars": len(prompt),
+        }
+        record_run(entry, report, patch)
+        if record is not None:
+            record.update(entry)
+            record["response"] = redact(outcome.text)
         return report
 
 
@@ -2367,6 +2376,218 @@ def _register_harness(harness: Harness) -> tuple[Callable[..., Any], Callable[..
     return delegate_tool, health_tool
 
 
+PANEL_MIN_RESPONSE_CHARS = 2_000
+
+
+def _one_line(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def _panel_table(rows: list[dict[str, Any]]) -> str:
+    header = f"{'harness':12} {'status':9} {'time':>8} {'tokens':>9} {'cost':>9}  {'run id':30} conversation id"
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        tokens = (row.get("tokens_in") or 0) + (row.get("tokens_out") or 0)
+        cost = row.get("cost_usd") or 0.0
+        lines.append(
+            f"{row['harness']:12} {row['status']:9} "
+            f"{str(row.get('duration_seconds', '?')) + 's':>8} {tokens or '-':>9} "
+            f"{('$%.4f' % cost) if cost else '-':>9}  {str(row.get('run_id') or '-'):30} "
+            f"{row.get('conversation_id') or '-'}"
+        )
+    return "\n".join(lines)
+
+
+async def consult_many(
+    prompt: Annotated[
+        str,
+        Field(
+            description=(
+                "The question, in full. The harnesses share this repository but NOT this "
+                "conversation, so paste the plan or decision itself and say what you want attacked: "
+                "'here is the plan ... what breaks, what did I miss, where am I wrong?'"
+            )
+        ),
+    ],
+    working_dir: WorkingDirArg,
+    harnesses: Annotated[
+        list[str] | None,
+        Field(description="Harness keys to ask, e.g. ['opencode', 'antigravity']. Default: every enabled harness."),
+    ] = None,
+    timeout_seconds: TimeoutArg = DEFAULT_TIMEOUT_SECONDS,
+    conversation_ids: Annotated[
+        dict[str, str] | None,
+        Field(
+            description=(
+                "Per harness, the Conversation ID from an earlier round: {'antigravity': 'conv-1'}. "
+                "Each named harness then answers with its previous critique still in context, so a "
+                "follow-up round costs one short rebuttal instead of restating the plan."
+            )
+        ),
+    ] = None,
+    ctx: _Context = None,
+) -> str:
+    """Put one question to several harnesses at once and return their answers side by side."""
+    keys = list(REGISTERED_TOOLS) if not harnesses else [str(k).strip() for k in harnesses if str(k).strip()]
+    unknown = [k for k in keys if k not in REGISTERED_TOOLS]
+    if unknown:
+        return (
+            f"[INVALID_ARGUMENT] unknown or disabled harness(es) {unknown}; "
+            f"available: {', '.join(REGISTERED_TOOLS)}."
+        )
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        return "[INVALID_ARGUMENT] no harness is enabled."
+    ids = conversation_ids or {}
+    if not isinstance(ids, dict):
+        return "[INVALID_ARGUMENT] conversation_ids must be an object mapping harness key to conversation id."
+
+    started = time.monotonic()
+    finished: dict[str, str] = {}
+
+    async def one(key: str) -> tuple[str, str, dict[str, Any]]:
+        entry: dict[str, Any] = {}
+        report = await delegate(
+            HARNESSES[key],
+            prompt,
+            working_dir,
+            None,
+            False,  # a consultation never auto-approves
+            timeout_seconds,
+            ids.get(key),
+            False,
+            None,  # per-harness heartbeats would interleave; the panel reports progress instead
+            read_only=True,
+            record=entry,
+        )
+        finished[key] = entry.get("status") or ("success" if report.startswith("[SUCCESS]") else "failure")
+        return key, report, entry
+
+    progress = _progress_sink(ctx)
+    done = asyncio.Event()
+
+    async def beat() -> None:
+        if progress is None:
+            return
+        try:
+            await progress(0.0, None, f"consulting {len(keys)} harness(es): {', '.join(keys)}")
+        except Exception:
+            return
+        ticks = 0
+        while not done.is_set():
+            try:
+                await asyncio.wait_for(done.wait(), timeout=heartbeat_seconds() or 15)
+            except asyncio.TimeoutError:
+                pass
+            if done.is_set():
+                return
+            ticks += 1
+            waiting = [k for k in keys if k not in finished]
+            try:
+                await progress(
+                    float(ticks),
+                    None,
+                    f"{int(time.monotonic() - started)}s | done: {', '.join(finished) or 'none'} "
+                    f"| still thinking: {', '.join(waiting)}",
+                )
+            except Exception:
+                return
+
+    beat_task = asyncio.ensure_future(beat())
+    try:
+        # The whole point: N harnesses think at the same time, so the panel costs the slowest
+        # answer rather than the sum of them.
+        results = await asyncio.gather(*(one(key) for key in keys))
+    finally:
+        done.set()
+        beat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await beat_task
+    elapsed = time.monotonic() - started
+
+    budget = max(PANEL_MIN_RESPONSE_CHARS, max_output_chars() // max(1, len(keys)))
+    rows: list[dict[str, Any]] = []
+    sections: list[tuple[str, str]] = []
+    answered = 0
+    for key, report, entry in results:
+        ok = report.startswith("[SUCCESS]")
+        answered += 1 if ok else 0
+        rows.append(
+            {
+                "harness": key,
+                "status": "answered" if ok else (entry.get("status") or "failed"),
+                "duration_seconds": entry.get("duration_seconds"),
+                "tokens_in": entry.get("tokens_in"),
+                "tokens_out": entry.get("tokens_out"),
+                "cost_usd": entry.get("cost_usd"),
+                "run_id": entry.get("run_id"),
+                "conversation_id": entry.get("conversation_id"),
+            }
+        )
+        body = entry.get("response") or ""
+        if not ok or not body.strip():
+            # Hand back the failure report itself: the caller still needs to know why it is missing.
+            body = (body + "\n\n" if body.strip() else "") + truncate(report, budget)
+        sections.append((f"{key} says", truncate(body, budget)))
+
+    panel_id = new_run_id()
+    prefix = "[SUCCESS]" if answered else "[ROADBLOCK / FAILURE]"
+    headline = (
+        f"{answered} of {len(keys)} harness(es) answered in {_fmt_duration(elapsed)} "
+        f"(run in parallel; the slowest one set this time)"
+    )
+    sections.insert(0, ("panel", _panel_table(rows)))
+    sections.append(
+        (
+            "NEXT STEP (orchestrator)",
+            "Read the answers against each other, do not average them.\n"
+            "  - Where two harnesses independently raise the same objection, treat it as real.\n"
+            "  - Where they disagree, that is the part of the plan you have not settled; decide it\n"
+            "    yourself or put the disagreement back to them.\n"
+            "  - To push back on one answer, call consult_<harness> with that row's Conversation ID,\n"
+            "    or call consult_many again with conversation_ids to re-ask the whole panel.\n"
+            f"  - Full untruncated text of any answer: get_run(\"<run id>\"). This panel: "
+            f'get_run("{panel_id}").\n'
+            "None of these harnesses could change a file: this was a read-only consultation.",
+        )
+    )
+    report = redact(
+        _render(
+            prefix,
+            headline,
+            [
+                ("Panel run ID", panel_id),
+                ("Working dir", str(working_dir)),
+                ("Asked", _one_line(prompt, 300)),
+            ],
+            sections,
+        )
+    )
+    record_run(
+        {
+            "run_id": panel_id,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "mode": "consult_many",
+            "harness": ",".join(keys),
+            "working_dir": str(working_dir),
+            "status": "success" if answered else "failure",
+            "duration_seconds": round(elapsed, 2),
+            "timeout_seconds": timeout_seconds,
+            "answered": answered,
+            "of": len(keys),
+            "child_runs": [row.get("run_id") for row in rows if row.get("run_id")],
+            "tokens_in": sum(row.get("tokens_in") or 0 for row in rows) or None,
+            "tokens_out": sum(row.get("tokens_out") or 0 for row in rows) or None,
+            "cost_usd": sum(row.get("cost_usd") or 0.0 for row in rows) or None,
+            "files_changed": [],
+            "prompt_chars": len(prompt),
+        },
+        report,
+    )
+    return report
+
+
 def _format_runs(records: list[dict[str, Any]]) -> str:
     if not records:
         return "(no runs recorded yet)"
@@ -2470,6 +2691,17 @@ mcp.tool(
         "remaining budget, or to find the Run ID of an earlier delegation."
     ),
 )(list_runs)
+mcp.tool(
+    name="consult_many",
+    description=(
+        "Put ONE question to several harnesses at once, read-only, and get their answers side by "
+        "side in a single result. This is the tool for 'what does another model think of this "
+        "plan?': the harnesses run in parallel, so a panel costs the slowest answer rather than the "
+        "sum, and none of them can change a file. They do not see this conversation, so put the "
+        "plan itself in the prompt. Each answer comes back with its own Conversation ID, so you can "
+        "push back on one of them, or re-ask the whole panel, without restating the plan."
+    ),
+)(consult_many)
 mcp.tool(
     name="get_run",
     description=(

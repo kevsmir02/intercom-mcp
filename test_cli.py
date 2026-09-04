@@ -483,7 +483,9 @@ class TestServe(CliFixture, unittest.IsolatedAsyncioTestCase):
                 health = result_text(await session.call_tool("check_claude_code_health", {}))
         self.assertEqual(
             names,
-            ["check_claude_code_health", "consult_claude_code", "delegate_to_claude_code", "get_run", "list_runs"],
+            ["check_claude_code_health", "consult_claude_code", "consult_many",
+             "delegate_to_claude_code", "get_run", "list_runs"],
+            "the shared tools must be present even with a single harness enabled",
         )
         self.assertTrue(health.startswith("[HEALTH: READY]"), health)
 

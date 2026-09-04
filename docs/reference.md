@@ -16,6 +16,7 @@ Shared:
 
 | Tool | What it does |
 | --- | --- |
+| `consult_many` | Puts one question to several harnesses at once, in parallel and read-only, and returns their answers side by side. |
 | `list_runs` | Recent runs: harness, status, duration, tokens, cost, files touched. |
 | `get_run` | One stored run by Run ID: the full report, its patch, or a one-line summary. |
 
@@ -48,10 +49,39 @@ those paths' size and mtime -- and compared with its state afterwards. The repor
 - **a commit warning** -- if `HEAD` moved, the report says so and lists the commits. A harness that
   commits its work would otherwise leave the tree looking clean, as if nothing had happened.
 
+## Second opinions (`consult_many`)
+
+`consult_many` asks several harnesses the same question at the same time. It is the tool behind
+"what does another model think of this plan?".
+
+```
+consult_many(prompt="<the plan, and what you want attacked>",
+             working_dir="/repo",
+             harnesses=["opencode", "antigravity"])   # default: every enabled harness
+```
+
+- **Parallel.** The panel costs the slowest answer, not the sum. Two harnesses answering in ~45s
+  each return together in ~45s.
+- **Read-only, and never queued.** Each answer is a `consult`, so nothing can be edited, and a panel
+  neither waits for a running delegation nor blocks one.
+- **Independent.** The harnesses see the repository but not each other's answers and not your
+  conversation, so two of them raising the same objection is real signal rather than agreement. Put
+  the plan itself in the prompt.
+- **Resumable per harness.** Every row of the panel carries that harness's Conversation ID. Push
+  back on one with `consult_<harness>`, or on all of them at once by calling `consult_many` again
+  with `conversation_ids={"antigravity": "...", "opencode": "..."}` and your rebuttal -- a second
+  round is one tool call and nobody is told the plan twice.
+- **Compact by default.** Each answer is capped at a share of `BRIDGE_MAX_OUTPUT_CHARS`; the panel
+  and every individual answer are journalled, so `get_run("<run id>")` returns any of them in full.
+
+A partly failed panel still returns `[SUCCESS]`: one answer is an answer, and the table says which
+harness is missing and why.
+
 ## One delegation per working tree
 
 A second delegation against a working tree that already has one running returns
-`[ROADBLOCK / FAILURE] working tree busy` instead of interleaving edits with the first. To run
+`[ROADBLOCK / FAILURE] working tree busy` instead of interleaving edits with the first.
+Consultations are exempt, since they change nothing. To run
 harnesses in parallel, either give each a different `working_dir`, or pass `isolate: true`.
 
 ## Isolated runs (`isolate: true`)

@@ -13,6 +13,7 @@ tools:
   intercom_consult_claude_code: true
   intercom_consult_opencode: true
   intercom_consult_pi: true
+  intercom_consult_many: true
   intercom_check_antigravity_health: true
   intercom_check_claude_code_health: true
   intercom_check_opencode_health: true

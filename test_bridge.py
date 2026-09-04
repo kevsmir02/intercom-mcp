@@ -348,7 +348,7 @@ class TestDiscovery(BridgeTestCase):
                 "delegate_to_claude_code", "consult_claude_code", "check_claude_code_health",
                 "delegate_to_opencode", "consult_opencode", "check_opencode_health",
                 "delegate_to_pi", "consult_pi", "check_pi_health",
-                "list_runs", "get_run",
+                "consult_many", "list_runs", "get_run",
             },
         )
         for name in ("delegate_to_antigravity", "delegate_to_claude_code", "delegate_to_opencode", "delegate_to_pi"):
@@ -883,6 +883,85 @@ class TestConsult(BridgeTestCase):
             await self.call(session, "consult_claude_code", prompt="opinion please")
             listing = await self.call(session, "list_runs")
         self.assertIn("consult", listing)
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestConsultPanel(BridgeTestCase):
+    async def test_panel_asks_every_harness_at_the_same_time(self) -> None:
+        async with self.session(FAKE_SLEEP="1.0") as session:
+            start = time.monotonic()
+            text = await self.call(session, "consult_many", prompt="__SLOW__ review this plan")
+            elapsed = time.monotonic() - start
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("4 of 4 harness(es) answered", text)
+        for key in ("antigravity", "claude_code", "opencode", "pi"):
+            self.assertIn(f"--- {key} says ---", text)
+        # Serially this would take at least 4s; in parallel it costs one harness's time.
+        self.assertLess(elapsed, 3.0, f"panel took {elapsed:.1f}s, so it did not run in parallel")
+
+    async def test_panel_can_be_limited_to_named_harnesses(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "consult_many", prompt="thoughts?",
+                                   harnesses=["opencode", "antigravity"])
+        self.assertIn("2 of 2 harness(es) answered", text)
+        self.assertIn("--- opencode says ---", text)
+        self.assertNotIn("--- claude_code says ---", text)
+
+    async def test_panel_rejects_an_unknown_harness(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "consult_many", prompt="x", harnesses=["gpt5"])
+        self.assertTrue(text.startswith("[INVALID_ARGUMENT]"), text)
+        self.assertIn("gpt5", text)
+
+    async def test_one_failing_harness_does_not_lose_the_others(self) -> None:
+        async with self.session(AGY_BIN="/nonexistent/agy") as session:
+            text = await self.call(session, "consult_many", prompt="review",
+                                   harnesses=["antigravity", "claude_code"])
+        self.assertTrue(text.startswith("[SUCCESS]"), text)  # one answer is still an answer
+        self.assertIn("1 of 2 harness(es) answered", text)
+        self.assertIn("--- claude_code says ---", text)
+        self.assertIn("not found", text)  # and it says why the other is missing
+
+    async def test_a_follow_up_round_resumes_each_harness_session(self) -> None:
+        async with self.session() as session:
+            text = await self.call(
+                session, "consult_many", prompt="but what about X?",
+                harnesses=["antigravity", "claude_code"],
+                conversation_ids={"antigravity": "agy-conv-123", "claude_code": "claude-sess-456"},
+            )
+        agy_part = text.split("--- antigravity says ---")[1].split("--- claude_code says ---")[0]
+        claude_part = text.split("--- claude_code says ---")[1]
+        self.assertIn("FAKE_RESUME: agy-conv-123", agy_part)
+        self.assertIn("FAKE_RESUME: claude-sess-456", claude_part)
+
+    async def test_a_consultation_neither_waits_for_nor_blocks_a_delegation(self) -> None:
+        async with self.session(FAKE_SLEEP="2.0") as session:
+            delegation = asyncio.ensure_future(
+                self.call(session, "delegate_to_antigravity", prompt="__SLOW__ edit things")
+            )
+            await asyncio.sleep(0.7)  # the delegation now holds the working-tree lock
+            start = time.monotonic()
+            panel = await self.call(session, "consult_many", prompt="quick question",
+                                    harnesses=["claude_code", "opencode"])
+            elapsed = time.monotonic() - start
+            self.assertTrue((await delegation).startswith("[SUCCESS]"))
+        self.assertIn("2 of 2 harness(es) answered", panel)
+        self.assertNotIn("working tree busy", panel)
+        self.assertLess(elapsed, 1.5, "a read-only panel must not queue behind a delegation")
+
+    async def test_the_panel_and_each_answer_are_retrievable_afterwards(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "consult_many", prompt="review", harnesses=["pi"])
+            panel_id = next(ln.split()[3] for ln in text.splitlines() if ln.startswith("Panel run ID:"))
+            child_id = next(
+                ln.split()[5] for ln in text.splitlines() if ln.startswith("pi ") and "answered" in ln
+            )
+            stored_panel = await self.call(session, "get_run", run_id=panel_id)
+            stored_answer = await self.call(session, "get_run", run_id=child_id)
+            listing = await self.call(session, "list_runs")
+        self.assertEqual(stored_panel.strip(), text.strip())
+        self.assertIn("PONG: review", stored_answer)
+        self.assertIn("consult_many", listing)
 
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")

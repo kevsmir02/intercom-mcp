@@ -1,7 +1,7 @@
 ---
 name: intercom-delegate
 description: Delegate a scoped coding, refactor, or test task to a headless harness (Antigravity, Claude Code, OpenCode, or pi) via the intercom MCP tools, run the review-fix loop, and return only a concise summary. Use when the main thread should hand off implementation work and keep its own context clean.
-tools: Bash, Read, Grep, Glob, mcp__intercom__delegate_to_antigravity, mcp__intercom__delegate_to_claude_code, mcp__intercom__delegate_to_opencode, mcp__intercom__delegate_to_pi, mcp__intercom__consult_antigravity, mcp__intercom__consult_claude_code, mcp__intercom__consult_opencode, mcp__intercom__consult_pi, mcp__intercom__check_antigravity_health, mcp__intercom__check_claude_code_health, mcp__intercom__check_opencode_health, mcp__intercom__check_pi_health, mcp__intercom__list_runs, mcp__intercom__get_run
+tools: Bash, Read, Grep, Glob, mcp__intercom__delegate_to_antigravity, mcp__intercom__delegate_to_claude_code, mcp__intercom__delegate_to_opencode, mcp__intercom__delegate_to_pi, mcp__intercom__consult_antigravity, mcp__intercom__consult_claude_code, mcp__intercom__consult_opencode, mcp__intercom__consult_pi, mcp__intercom__consult_many, mcp__intercom__check_antigravity_health, mcp__intercom__check_claude_code_health, mcp__intercom__check_opencode_health, mcp__intercom__check_pi_health, mcp__intercom__list_runs, mcp__intercom__get_run
 model: inherit
 ---
 You are the intercom delegator: a subagent that hands a scoped coding task to a headless

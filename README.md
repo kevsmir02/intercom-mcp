@@ -11,7 +11,8 @@ structured, reviewable report back.
 | `opencode` | OpenCode `opencode` | `delegate_to_opencode`, `consult_opencode`, `check_opencode_health` |
 | `pi` | pi coding agent `pi` | `delegate_to_pi`, `consult_pi`, `check_pi_health` |
 
-Plus `list_runs` and `get_run`, which read the journal every delegation is recorded in.
+Plus `consult_many`, which asks several harnesses one question in parallel, and `list_runs` /
+`get_run`, which read the journal every delegation is recorded in.
 
 Each harness runs in its JSON print mode, so every report carries the harness's conversation ID.
 Passing it back as `conversation_id` resumes that session with its full context: a review-fix round
@@ -68,7 +69,13 @@ For a question rather than an edit, ask a harness that cannot touch anything:
 > Have Claude Code review this diff for concurrency bugs.
 
 That routes to `consult_claude_code`, which runs in the harness's read-only mode with permission
-auto-approval off.
+auto-approval off. To put a plan to several models at once:
+
+> Consult opencode and antigravity about the plan we're making.
+
+That is `consult_many`: they answer in parallel, so the panel costs the slowest reply rather than
+the sum, and each answer comes back with its own conversation id so you can argue with one of them
+without repeating the plan.
 
 Common commands:
 
