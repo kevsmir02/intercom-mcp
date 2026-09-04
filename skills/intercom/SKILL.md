@@ -6,9 +6,11 @@ description: Delegate implementation, refactoring or test-writing work to a head
 # Intercom: delegate, review, fix
 
 You are the orchestrator. The harness is a subagent with its own quota, tools and memory:
-it edits files and runs tests; you own the brief, the review and the acceptance. The
-tools are `delegate_to_antigravity`, `delegate_to_claude_code` and the matching
-`check_<harness>_health`; their parameters are documented in the tool descriptions.
+it edits files and runs tests; you own the brief, the review and the acceptance. Per harness
+(`antigravity`, `claude_code`, `opencode`, `pi`) you get `delegate_to_<harness>` (it edits),
+`consult_<harness>` (read-only: it answers, it cannot change anything) and
+`check_<harness>_health`. `list_runs` and `get_run` read the run journal. Parameters are
+documented in the tool descriptions.
 
 ## Loop
 
@@ -22,24 +24,37 @@ tools are `delegate_to_antigravity`, `delegate_to_claude_code` and the matching
    asking a question.
 3. **Delegate** with `delegate_to_<harness>`: absolute `working_dir`,
    `include_diff: true` when the report alone should be enough to review,
-   `timeout_seconds` sized to the task (default 900), the model via `flags`.
+   `timeout_seconds` sized to the task (default 900). Add `isolate: true` to run in a
+   throwaway git worktree instead of the real tree -- use it when the tree is dirty, or
+   to race the same brief on two harnesses at once. Only one non-isolated delegation
+   runs per working tree; a second returns "working tree busy".
 4. **Branch on the prefix** of the report:
    - `[SUCCESS]`: review (step 5).
    - `[ROADBLOCK / FAILURE]`: read "Probable cause" and the diagnostics. An
-     environment cause goes back to step 1 (or to the other harness), a brief defect
+     environment cause goes back to step 1 (or to another harness), a brief defect
      to step 2, a code or test failure to step 6.
    - `[TIMEOUT_ERROR]`: inspect the partial logs and the working tree; split the task
      or raise the timeout, then step 3.
    - `[INVALID_ARGUMENT]`: fix the call.
-5. **Review** every file in the report's `git status --short` list, reading the diff
-   (from the report or `git diff`), then run the test command yourself. Done when each
-   changed file is accounted for as correct and the tests are green.
+5. **Review** the report's "changed by this delegation" list. It is attributed: files
+   that were already modified before the run are listed separately and are not the
+   harness's work. Read the diff (from the report or `git diff`), then run the test
+   command yourself. Done when each changed file is accounted for as correct and the
+   tests are green. A "the harness committed" warning means the work is in a commit, not
+   in the tree -- say so when you report. For a second opinion on a risky diff, ask a
+   different harness with `consult_<harness>`.
 6. **Fix round**: re-delegate with `conversation_id` from the report and a short brief:
    the findings, the recommended fix, the same acceptance criteria. The harness keeps
    its context, so the original task stays out of the fix brief. After three rounds
    without a green review, take the work over yourself.
 7. **Accept**: summarise what changed and what was verified. Commit from this
-   conversation once accepted.
+   conversation once accepted. An isolated run is accepted by applying its patch:
+   the report gives the `git apply` command, or run `intercom apply <run id>`.
+
+Every report carries a **Run ID**. `get_run("<id>")` returns the whole stored report later,
+so you can keep only the conclusion in context now and fetch the detail if you need it.
+`list_runs()` shows recent runs with status, duration, tokens and cost -- useful for
+choosing a harness by what has actually been working and what it has been costing.
 
 ## Choosing a harness
 
@@ -65,8 +80,10 @@ verbose report and diff stay in the subagent's context. `intercom setup` install
   user names one.
 
 - Keep secrets out of the brief: the harness inherits the environment and stores its
-  transcript.
-- One task per delegation, one delegation at a time per working tree; parallel edits
-  in the same tree collide.
+  transcript. Delegations run with permission auto-approval on and no sandbox; use
+  `consult_<harness>` when you only need an answer, not an edit.
+- One task per delegation. The bridge enforces one delegation at a time per working
+  tree; to run harnesses in parallel, give each `isolate: true` (separate worktrees) or a
+  different `working_dir`.
 - The bridge refuses nested delegation past `BRIDGE_MAX_DEPTH`. A roadblock naming
   depth means: do the work directly.

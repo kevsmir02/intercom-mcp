@@ -1,0 +1,32 @@
+# Project metadata and tool configuration.
+#
+# intercom is installed as a git checkout (install.sh, or `git clone` plus `intercom setup`), not
+# from an index: the launcher, the bundled skill and the `intercom-delegate` subagents are resolved
+# relative to that checkout, and `intercom update` is a `git pull`. This file exists for metadata
+# and for the dev tooling below, not to publish a wheel.
+[project]
+name = "intercom-mcp"
+version = "2.1.0"
+description = "MCP server that delegates coding tasks to headless harnesses (Antigravity, Claude Code, OpenCode, pi) and returns reviewable reports"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.2,<3"]
+
+[project.urls]
+Homepage = "https://github.com/kevsmir02/intercom-mcp"
+Issues = "https://github.com/kevsmir02/intercom-mcp/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4"]
+ignore = ["E501"]  # long lines are checked by line-length, not the pycodestyle rule
+
+[tool.pytest.ini_options]
+testpaths = ["test_bridge.py", "test_cli.py"]

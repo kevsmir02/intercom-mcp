@@ -22,16 +22,26 @@ If `~/.local/bin` is not on your `PATH`, the installer says so; add
 | `intercom setup` | The setup wizard. Safe to re-run: it preserves your current selection and lets you toggle harnesses, flags or orchestrators. |
 | `intercom setup --harness claude_code --orchestrator opencode --flags claude_code="--model sonnet" --yes` | Scripted setup for dotfiles and CI |
 | `intercom setup --orchestrator antigravity --claude-config-dir ~/.claude-b` | Also register the Antigravity CLI and an extra Claude profile |
+| `intercom setup --allowed-dir ~/Projects` | Confine every delegation to that directory tree (repeatable; see [SECURITY.md](../SECURITY.md)) |
 | `intercom doctor` | Health of the enabled harnesses plus registration, skill and subagent checks; exits non-zero on any failure |
 | `intercom serve` | Runs the MCP server on stdio. This is what the registrations invoke |
 | `intercom test` | Runs the hermetic test suite (fake harnesses, no quota consumed) |
 | `intercom update` | `git pull` plus dependency reinstall |
 | `intercom config` | Prints the configuration and every path in use |
+| `intercom runs` | Recent delegations: harness, status, duration, tokens, cost, files touched (`--limit`, `--harness`, `--status`) |
+| `intercom show <run id> [--patch]` | The stored report of one run, or the patch an isolated run produced |
+| `intercom apply <run id> [--repo DIR]` | Applies an isolated run's patch to a working tree |
 | `intercom uninstall [--purge]` | Removes registrations, skill links, launcher and config; `--purge` also deletes the checkout |
 
 `serve` turns `config.json` into the environment variables the server reads, filling in only what the
 orchestrator's own environment block left unset. Setting `INTERCOM_HARNESSES=claude_code` there, for
-example, exposes only Claude Code's tools.
+example, exposes only Claude Code's tools. Anything under the config's `env` object is passed through
+the same way, so settings without a dedicated flag (`BRIDGE_KEEP_RUNS`, `AGY_BIN`, ...) can live
+there too.
+
+Re-running setup is also how you *undo* a choice: deselecting an orchestrator removes its
+registration, its subagent and skill links, and the guidance block it added to your instruction
+file.
 
 ## Updating
 
@@ -62,8 +72,12 @@ cd intercom-mcp
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python test_bridge.py
+.venv/bin/python test_cli.py
 .venv/bin/python intercom.py setup
 ```
+
+Run the suites with `python test_bridge.py` and `python test_cli.py` (or `pytest`); both are hermetic,
+using fake harness binaries and a throwaway HOME, so they need no harness CLI and consume no quota.
 
 `intercom.py setup` writes the launcher and performs the same registrations as the installer. To
 register by hand instead, use `opencode.json` in this repository as the OpenCode template and

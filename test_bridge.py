@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -89,14 +90,17 @@ if is_claude and args[:1] == ["mcp"]:
             fh.write(" ".join(args) + "\n")
     sub = args[1] if len(args) > 1 else ""
     if sub == "add" and marker:
-        open(marker, "w").write("registered\n")
+        open(marker, "w").write(" ".join(args) + "\n")
     elif sub == "remove":
         if marker and os.path.exists(marker):
             os.remove(marker)
         else:
             sys.exit(1)
     elif sub == "get":
-        sys.exit(0 if marker and os.path.exists(marker) else 1)
+        if marker and os.path.exists(marker):
+            out(open(marker).read())  # echo the registered command, like the real `claude mcp get`
+            sys.exit(0)
+        sys.exit(1)
     sys.exit(0)
 if is_claude and args[:2] == ["auth", "status"]:
     out(json.dumps({"loggedIn": not os.environ.get("FAKE_AUTH_FAIL"), "authMethod": "claude.ai",
@@ -186,6 +190,10 @@ if "__EDIT__:" in prompt:
     with open(target, "a") as fh:
         fh.write("appended by fake harness\n")
     text += "\nedited " + target
+if "__COMMIT__" in prompt:
+    subprocess.run(["git", "add", "-A"], check=False)
+    subprocess.run(["git", "-c", "user.name=h", "-c", "user.email=h@h", "commit", "-qm", "harness commit"], check=False)
+    text += "\ncommitted the work"
 status_error = "__STATUSERR__" in prompt
 
 if is_opencode:
@@ -243,7 +251,8 @@ def input_schema(tool) -> dict:
 
 
 CONFIG_KEYS = {"AGY_BIN", "AGY_AUTO_APPROVE_FLAGS", "AGY_DEFAULT_FLAGS", "CLAUDE_BIN", "CLAUDE_AUTO_APPROVE_FLAGS",
-               "CLAUDE_DEFAULT_FLAGS", "CLAUDECODE", "OPENCODE_BIN", "PI_BIN", "CLAUDE_CONFIG_DIR"}
+               "CLAUDE_DEFAULT_FLAGS", "CLAUDECODE", "OPENCODE_BIN", "PI_BIN", "CLAUDE_CONFIG_DIR",
+               "INTERCOM_HARNESSES", "INTERCOM_STATE_DIR", "XDG_STATE_HOME"}
 
 
 class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
@@ -283,6 +292,7 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
                 "PI_BIN": str(self.fake_pi),
                 "BRIDGE_KILL_GRACE_SECONDS": "1",
                 "BRIDGE_LOG_LEVEL": "WARNING",
+                "INTERCOM_STATE_DIR": str(self.tmp / "state"),  # never touch the developer's real run journal
             }
         )
         env.update(overrides)
@@ -299,14 +309,26 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
                 yield session
 
     async def call(self, session: ClientSession, tool: str, **arguments) -> str:
-        if tool.startswith("delegate_to_"):
+        if tool.startswith(("delegate_to_", "consult_")):
             arguments.setdefault("working_dir", str(self.workdir))
         return result_text(await session.call_tool(tool, arguments))
 
-    def init_repo(self) -> None:
+    def init_repo(self, commit: bool = False) -> None:
         if not shutil.which("git"):
             self.skipTest("git not installed")
         subprocess.run(["git", "init", "-q"], cwd=self.workdir, check=True)
+        if commit:
+            (self.workdir / "seed.txt").write_text("seed\n")
+            subprocess.run(["git", "add", "-A"], cwd=self.workdir, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "seed"],
+                cwd=self.workdir, check=True,
+            )
+
+    def git(self, *args: str, cwd: Path | None = None) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd or self.workdir, capture_output=True, text=True, check=True
+        ).stdout
 
 
 # ---------------------------------------------------------------------------
@@ -322,22 +344,29 @@ class TestDiscovery(BridgeTestCase):
         self.assertEqual(
             set(tools),
             {
-                "delegate_to_antigravity", "check_antigravity_health",
-                "delegate_to_claude_code", "check_claude_code_health",
-                "delegate_to_opencode", "check_opencode_health",
-                "delegate_to_pi", "check_pi_health",
+                "delegate_to_antigravity", "consult_antigravity", "check_antigravity_health",
+                "delegate_to_claude_code", "consult_claude_code", "check_claude_code_health",
+                "delegate_to_opencode", "consult_opencode", "check_opencode_health",
+                "delegate_to_pi", "consult_pi", "check_pi_health",
+                "list_runs", "get_run",
             },
         )
         for name in ("delegate_to_antigravity", "delegate_to_claude_code", "delegate_to_opencode", "delegate_to_pi"):
             schema = input_schema(tools[name])
             props = schema["properties"]
             self.assertEqual(set(schema["required"]), {"prompt", "working_dir"})
-            for prop in ("prompt", "working_dir", "flags", "auto_approve", "timeout_seconds", "conversation_id", "include_diff"):
+            for prop in ("prompt", "working_dir", "flags", "auto_approve", "timeout_seconds",
+                         "conversation_id", "include_diff", "isolate"):
                 self.assertIn(prop, props, name)
             self.assertEqual(props["auto_approve"]["default"], True)
             self.assertEqual(props["timeout_seconds"]["default"], 900)
             self.assertEqual(props["include_diff"]["default"], False)
+            self.assertEqual(props["isolate"]["default"], False)
             self.assertIn("Conversation ID", tools[name].description)
+        for name in ("consult_antigravity", "consult_claude_code", "consult_opencode", "consult_pi"):
+            props = input_schema(tools[name])["properties"]
+            self.assertNotIn("auto_approve", props, name)  # a consultation may never auto-approve an edit
+            self.assertNotIn("isolate", props, name)  # it changes nothing, so it needs no worktree
         for name in ("check_antigravity_health", "check_claude_code_health", "check_opencode_health", "check_pi_health"):
             self.assertFalse(input_schema(tools[name]).get("required"))
             self.assertIn("[HEALTH: READY]", tools[name].description)
@@ -463,14 +492,21 @@ class TestAntigravityExecution(BridgeTestCase):
         self.assertTrue(text.startswith("[SUCCESS]"), text)
         self.assertIn("PONG: via path", text)
 
-    async def test_large_prompt_is_piped_via_stdin(self) -> None:
+    async def test_large_prompt_stays_on_the_command_line(self) -> None:
+        # agy cannot read a prompt from stdin (verified: `-p ""` + pipe -> "Error: empty prompt"),
+        # so an oversized brief must stay on argv rather than vanish from the command line.
         big = "x" * (bridge.PROMPT_ARG_MAX_BYTES + 1000)
         async with self.session() as session:
             text = await self.call(session, "delegate_to_antigravity", prompt=big)
         self.assertTrue(text.startswith("[SUCCESS]"), text)
-        self.assertIn("FAKE_PROMPT_SOURCE: stdin", text)
+        self.assertIn("FAKE_PROMPT_SOURCE: arg", text)
         self.assertIn(f"FAKE_PROMPT_LEN: {len(big)}", text)
-        self.assertIn("piped via stdin", text)
+
+    async def test_prompt_too_large_for_argv_is_rejected_not_dropped(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="z" * (bridge.ARGV_PROMPT_MAX_BYTES + 1))
+        self.assertTrue(text.startswith("[INVALID_ARGUMENT]"), text)
+        self.assertIn("only accepts it on the command line", text)
 
     async def test_git_summary_and_full_diff(self) -> None:
         self.init_repo()
@@ -486,17 +522,19 @@ class TestAntigravityExecution(BridgeTestCase):
                 session, "delegate_to_antigravity", prompt="__EDIT__:tracked.txt __WRITE__:other.txt", include_diff=True
             )
         self.assertTrue(summary_only.startswith("[SUCCESS]"), summary_only)
-        self.assertIn("$ git status --short", summary_only)
+        self.assertIn("changed by this delegation (1 path(s))", summary_only)
         self.assertIn("?? newfile.txt", summary_only)
-        self.assertIn("$ git diff --stat HEAD", summary_only)
-        self.assertNotIn("$ git diff HEAD (plus untracked", summary_only)
+        self.assertNotIn("files changed by this delegation>", summary_only)  # no diff without include_diff
 
         self.assertTrue(full.startswith("[SUCCESS]"), full)
         self.assertIn(" M tracked.txt", full)
-        self.assertIn("$ git diff HEAD (plus untracked files via --no-index)", full)
+        self.assertIn("files changed by this delegation>", full)
         self.assertIn("+appended by fake harness", full)
         self.assertIn("+++ b/other.txt", full)
         self.assertIn("+generated by fake harness", full)
+        # newfile.txt was created by the FIRST delegation, so the second must not claim it.
+        self.assertIn("already modified before this delegation", full)
+        self.assertIn("?? newfile.txt", full.split("already modified before this delegation")[1])
 
     async def test_failure_report_contains_diagnostics_and_call_to_action(self) -> None:
         async with self.session() as session:
@@ -688,6 +726,184 @@ class TestPiExecution(BridgeTestCase):
 
 
 @unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestChangeAttribution(BridgeTestCase):
+    async def test_pre_existing_edits_are_not_blamed_on_the_delegation(self) -> None:
+        self.init_repo(commit=True)
+        (self.workdir / "seed.txt").write_text("edited by the human before delegating\n")
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="__WRITE__:fresh.txt", include_diff=True)
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        attributed, _, pre_existing = text.partition("already modified before this delegation")
+        self.assertIn("?? fresh.txt", attributed)
+        self.assertNotIn("seed.txt", attributed.split("changed by this delegation")[1])
+        self.assertIn("seed.txt", pre_existing)
+        self.assertNotIn("edited by the human", text)  # the pre-existing diff is not dumped into the report
+
+    async def test_a_harness_that_commits_is_flagged_not_reported_as_clean(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="__WRITE__:added.txt")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "human commit")
+        # A second delegation that commits its own work must not look like "nothing changed".
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="__WRITE__:committed.txt __COMMIT__")
+        self.assertIn("WARNING: the harness committed during this run", text)
+        self.assertIn("committed committed.txt", text)
+        self.assertNotIn("changed by this delegation: (nothing", text)
+
+    async def test_clean_tree_reports_nothing_changed(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="just answer, touch nothing")
+        self.assertIn("changed by this delegation: (nothing", text)
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestWorkingTreeLock(BridgeTestCase):
+    async def test_concurrent_delegations_in_one_tree_are_refused(self) -> None:
+        async with self.session(FAKE_SLEEP="2.0") as session:
+            first = asyncio.ensure_future(self.call(session, "delegate_to_antigravity", prompt="__SLOW__ one"))
+            await asyncio.sleep(0.7)  # let the first delegation take the lock
+            second = await self.call(session, "delegate_to_claude_code", prompt="two")
+            first_text = await first
+        self.assertTrue(first_text.startswith("[SUCCESS]"), first_text)
+        self.assertTrue(second.startswith("[ROADBLOCK / FAILURE]"), second)
+        self.assertIn("working tree busy", second)
+        self.assertIn("isolate=true", second)
+
+    async def test_lock_is_released_after_a_delegation(self) -> None:
+        async with self.session() as session:
+            await self.call(session, "delegate_to_antigravity", prompt="one")
+            text = await self.call(session, "delegate_to_antigravity", prompt="two")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestIsolatedWorktree(BridgeTestCase):
+    async def test_isolated_run_leaves_the_real_tree_untouched_and_stores_a_patch(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session() as session:
+            text = await self.call(
+                session, "delegate_to_antigravity", prompt="__WRITE__:isolated.txt", isolate=True
+            )
+            run_id = next(ln.split()[2] for ln in text.splitlines() if ln.startswith("Run ID:"))
+            patch = await self.call(session, "get_run", run_id=run_id, section="patch")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("throwaway git worktree", text)
+        self.assertFalse((self.workdir / "isolated.txt").exists(), "the real working tree must not be touched")
+        self.assertEqual(self.git("status", "--porcelain"), "", "the real working tree must stay clean")
+        self.assertIn("isolated.txt", patch)
+        self.assertIn("+generated by fake harness", patch)
+        self.assertNotIn("worktrees", self.git("worktree", "list"), "the throwaway worktree must be removed")
+
+    async def test_isolated_runs_do_not_block_each_other(self) -> None:
+        self.init_repo(commit=True)
+        async with self.session(FAKE_SLEEP="1.2") as session:
+            both = await asyncio.gather(
+                self.call(session, "delegate_to_antigravity", prompt="__SLOW__ __WRITE__:a.txt", isolate=True),
+                self.call(session, "delegate_to_claude_code", prompt="__SLOW__ __WRITE__:b.txt", isolate=True),
+            )
+        for text in both:
+            self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    async def test_isolate_without_a_repository_falls_back_with_a_note(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="hello", isolate=True)
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        self.assertIn("isolate=true needs a git repository", text)
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestRunJournal(BridgeTestCase):
+    async def test_runs_are_recorded_and_retrievable(self) -> None:
+        async with self.session() as session:
+            report = await self.call(session, "delegate_to_claude_code", prompt="do a thing")
+            listing = await self.call(session, "list_runs")
+            run_id = next(ln.split()[2] for ln in report.splitlines() if ln.startswith("Run ID:"))
+            stored = await self.call(session, "get_run", run_id=run_id)
+            summary = await self.call(session, "get_run", run_id=run_id, section="summary")
+            missing = await self.call(session, "get_run", run_id="20200101T000000Z-deadbeef")
+        self.assertIn(run_id, listing)
+        self.assertIn("claude_code", listing)
+        self.assertIn("$0.0123", listing)  # the harness's reported cost is journalled
+        self.assertIn("1 run(s): 1 success", listing)
+        self.assertEqual(stored.strip(), report.strip())
+        self.assertIn(run_id, summary)
+        self.assertIn("[INVALID_ARGUMENT]", missing)
+
+    async def test_failures_are_journalled_too_and_can_be_filtered(self) -> None:
+        async with self.session() as session:
+            await self.call(session, "delegate_to_antigravity", prompt="run tests __FAIL__")
+            await self.call(session, "delegate_to_claude_code", prompt="fine")
+            failures = await self.call(session, "list_runs", status="failure")
+            by_harness = await self.call(session, "list_runs", harness="claude_code")
+        self.assertIn("1 run(s): 1 failure", failures)
+        self.assertIn("antigravity", failures)
+        self.assertNotIn("claude_code", failures)
+        self.assertIn("1 run(s): 1 success", by_harness)
+
+    async def test_bad_arguments_are_rejected(self) -> None:
+        async with self.session() as session:
+            self.assertIn("[INVALID_ARGUMENT]", await self.call(session, "list_runs", limit=0))
+            self.assertIn("[INVALID_ARGUMENT]", await self.call(session, "get_run", run_id="../etc/passwd"))
+            self.assertIn(
+                "[INVALID_ARGUMENT]",
+                await self.call(session, "get_run", run_id="20200101T000000Z-deadbeef", section="stdout"),
+            )
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestConsult(BridgeTestCase):
+    async def test_consult_runs_read_only_without_auto_approval(self) -> None:
+        async with self.session() as session:
+            text = await self.call(session, "consult_antigravity", prompt="what does this module do?")
+        self.assertTrue(text.startswith("[SUCCESS]"), text)
+        args_line = next(ln for ln in text.splitlines() if ln.startswith("FAKE_ARGS:"))
+        self.assertIn("--mode plan", args_line)
+        self.assertNotIn("--dangerously-skip-permissions", args_line)
+        self.assertIn("read-only consultation", text)
+
+    async def test_each_harness_gets_its_own_read_only_flags(self) -> None:
+        expected = {
+            "consult_claude_code": "--permission-mode plan",
+            "consult_opencode": "--agent plan",
+            "consult_pi": "--exclude-tools edit,write",
+        }
+        async with self.session() as session:
+            for tool, flags in expected.items():
+                text = await self.call(session, tool, prompt="review this")
+                self.assertIn(flags, text, tool)
+
+    async def test_consult_is_journalled_as_a_consultation(self) -> None:
+        async with self.session() as session:
+            await self.call(session, "consult_claude_code", prompt="opinion please")
+            listing = await self.call(session, "list_runs")
+        self.assertIn("consult", listing)
+
+
+@unittest.skipUnless(os.name == "posix", "fake harnesses need a POSIX shell environment")
+class TestSafety(BridgeTestCase):
+    async def test_working_dir_outside_the_allowlist_is_refused(self) -> None:
+        allowed = self.tmp / "allowed"
+        allowed.mkdir()
+        async with self.session(BRIDGE_ALLOWED_DIRS=str(allowed)) as session:
+            blocked = await self.call(session, "delegate_to_antigravity", prompt="hi")
+            permitted = await self.call(session, "delegate_to_antigravity", prompt="hi", working_dir=str(allowed))
+        self.assertTrue(blocked.startswith("[INVALID_ARGUMENT]"), blocked)
+        self.assertIn("BRIDGE_ALLOWED_DIRS", blocked)
+        self.assertTrue(permitted.startswith("[SUCCESS]"), permitted)
+
+    async def test_secrets_in_harness_output_are_redacted(self) -> None:
+        async with self.session(MY_TEST_API_KEY="sk-supersecret-value") as session:
+            text = await self.call(session, "delegate_to_antigravity", prompt="echo sk-supersecret-value back")
+        self.assertNotIn("sk-supersecret-value", text)
+        self.assertIn("[redacted:$MY_TEST_API_KEY]", text)
+
+
 class TestDepthGuard(BridgeTestCase):
     async def test_delegation_is_refused_at_max_depth(self) -> None:
         async with self.session(BRIDGE_DEPTH="1") as session:
@@ -799,9 +1015,18 @@ class TestHelpers(unittest.TestCase):
 
     def test_build_argv_stdin_fallbacks(self) -> None:
         big = "y" * (bridge.PROMPT_ARG_MAX_BYTES + 1)
+        # agy has no stdin path, so the prompt stays on argv and `-p` is never dropped.
         argv, stdin = bridge.build_argv(AGY, "agy", big, ["--sandbox"], True, 10, approve_flags=["--x"], extra_flags=[])
+        self.assertIsNone(stdin)
+        self.assertEqual(argv[1], "-p")
+        self.assertEqual(argv[2], big)
+        with self.assertRaises(ValueError):
+            bridge.build_argv(AGY, "agy", "y" * (bridge.ARGV_PROMPT_MAX_BYTES + 1), [], True, 10,
+                              approve_flags=[], extra_flags=[])
+        # claude does read stdin, so the same prompt is piped there.
+        argv, stdin = bridge.build_argv(CLAUDE, "claude", big, [], True, 10, approve_flags=[], extra_flags=[])
         self.assertEqual(stdin, big.encode())
-        self.assertNotIn("-p", argv)
+        self.assertEqual(argv[:2], ["claude", "-p"])
         argv, stdin = bridge.build_argv(CLAUDE, "claude", "-starts with dash", [], True, 10, approve_flags=[], extra_flags=[])
         self.assertEqual(stdin, b"-starts with dash")
         self.assertEqual(argv[:2], ["claude", "-p"])
@@ -952,6 +1177,28 @@ class TestHelpers(unittest.TestCase):
 
 
 @unittest.skipUnless(os.name == "posix", "uses bash")
+class TestDescendantDiscovery(unittest.TestCase):
+    def test_ps_and_proc_agree_on_this_process_tree(self) -> None:
+        """The `ps` fallback (used where there is no /proc, e.g. macOS) must find the same tree."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            from_proc = bridge._children_from_proc()
+            from_ps = bridge._children_from_ps()
+            if from_proc is None or from_ps is None:
+                self.skipTest("both /proc and ps are needed to compare them")
+            self.assertIn(child.pid, from_ps.get(os.getpid(), []))
+            self.assertIn(child.pid, from_proc.get(os.getpid(), []))
+            self.assertIn(child.pid, bridge.descendant_pids(os.getpid()))
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_walk_terminates_on_a_cyclic_table(self) -> None:
+        bogus = {1: [2], 2: [1]}
+        with unittest.mock.patch.object(bridge, "_children_from_proc", return_value=bogus):
+            self.assertEqual(sorted(bridge.descendant_pids(1)), [2])
+
+
 class TestProcessRunner(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_kills_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
